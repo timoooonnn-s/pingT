@@ -2,38 +2,12 @@
 """
 Timmy Pinger (pingT) - watch hundreds of hosts at once during a switch migration.
 
-Start it with the ./pingT launcher; this module holds the code (scan.py imports it).
+Pings every host once per round with fping and shows all of them on one screen; only
+several lost pings raise an alarm. Start it with the ./pingT launcher (scan.py imports
+this module too). How it works and all options: README.md.
 
-Pings every host once per round with fping,
-keeps a rolling window per host and only raises an alarm after several misses:
-
-  OK    green   < --warn lost in the window          (a single stray drop is ignored)
-  WARN  yellow  >= --warn lost in the window         (repeated drops)
-  LOSS  red     >= --loss lost in the window         (real packet loss)
-  DOWN  red bg  >= --down consecutive misses         (host unreachable)
-
-Hosts file (one host per line, '#' comments), any of:
-  [Server VLAN 10]              section header = group for following hosts
-  10.0.10.5   core-sw01         ip-or-name  [label]
-  10.0.20.7,printer-2f,Office   CSV: ip,label,group
-Hosts without a group are grouped by their /24.
-
-A host that has never answered is SILENT (dim, no alarm) - it was already offline
-before the migration. "back N/M" = hosts reachable now out of all hosts that
-answered at some point. Hosts that answered are remembered in a baseline file
-next to the log, so after a restart/crash they alarm as DOWN instead of SILENT
-(--fresh starts a new baseline). Invalid entries are reported, not pinged.
-
-Reverse DNS: at most ONE PTR query per host for its whole runtime (cached, throttled
-to --dns-rate queries/s, off with --no-dns); "n" then shows FQDNs instead of labels,
-falling back to the IP when a host has no PTR record.
-
-Operator can IGNORE the DOWN hosts of a group (x, group number, same number again) -
-e.g. clients whose users went home before the cut-over. They stay pinged and are watched
-again after --down replies in a row; the summary lists them.
-
-Keys:  q quit   r r reset stats (press twice)   v compact/detail view   n labels/FQDN
-       s sort (detail view)   x ignore DOWN hosts of a group (x u = undo)
+Keys:  q quit   r r reset stats   v view   n labels/DNS names   x ignore DOWN hosts of a group
+       Esc cancels a question (r r, x)
 """
 
 from __future__ import annotations
@@ -51,9 +25,11 @@ import signal
 import socket
 import subprocess
 import sys
+import termios
 import threading
 import time
-from collections import deque
+import tty
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -76,7 +52,7 @@ except ModuleNotFoundError as e:
 UNKNOWN, NEVER, OK, WARN, LOSS, DOWN, INVALID, IGNORED = \
     "UNKN", "SILENT", "OK", "WARN", "LOSS", "DOWN", "INVALID", "IGNORED"
 SEVERITY = {DOWN: 0, LOSS: 1, WARN: 2, INVALID: 3, UNKNOWN: 4, OK: 5, NEVER: 6, IGNORED: 7}
-IGNORE_CONFIRM_S = 5  # the x dialog closes after this many seconds without a key
+ASK_TIMEOUT_S = 5  # a question (r r, the x dialog) closes after this many seconds without an answer
 
 
 @dataclass
@@ -111,7 +87,16 @@ class Host:
     def window_loss_pct(self) -> float:
         return 100.0 * self.window_lost / len(self.history) if self.history else 0.0
 
-    def reset(self):
+    @property
+    def who(self) -> str:
+        """"label (IP)", or only the IP when it has no label."""
+        return f"{self.label} ({self.target})" if self.label != self.target else self.target
+
+    def reset(self, keep_outage: bool = False):
+        """Clears the stats. keep_outage (r r): a host that is DOWN right now stays DOWN with its
+        outage running since it started - it must not count as back, or alarm a second time."""
+        down = keep_outage and self.state == DOWN
+        streak = self.consec_miss, self.miss_streak_start
         self.history.clear()
         self.sent = self.lost = self.consec_miss = 0
         self.miss_streak_start = None
@@ -123,6 +108,9 @@ class Host:
             self.state = INVALID
         elif self.ignored_at is not None:
             self.state = IGNORED
+        elif down:
+            self.state, self.outages = DOWN, 1
+            self.consec_miss, self.miss_streak_start = streak
 
 
 def is_back(h: Host) -> bool:
@@ -130,9 +118,14 @@ def is_back(h: Host) -> bool:
     return h.ever_up and h.state != DOWN
 
 
-def problem_order(h: Host):
-    """Sort key: worst state first, then most loss in the window, then inventory order."""
-    return SEVERITY[h.state], -h.window_lost, h.order
+def back_counts(hosts: list[Host]) -> tuple[int, int]:
+    """(hosts reachable now = not DOWN, hosts that ever answered)"""
+    return sum(1 for h in hosts if is_back(h)), sum(1 for h in hosts if h.ever_up)
+
+
+def all_back(up: int, seen: int) -> bool:
+    """Green "back": every host that answered at some point is back (0/0 is not green)."""
+    return up == seen and seen > 0
 
 
 def auto_group(target: str) -> str:
@@ -160,10 +153,8 @@ def parse_hosts_file(path: str) -> list[tuple[str, str, str | None, str]]:
             if line.startswith("[") and line.endswith("]"):
                 section = line[1:-1].strip() or None
                 continue
-            first = line.split(None, 1)[0]
-            delim = ";" if ";" in first else ("," if "," in first else None)
-            if delim:  # CSV: ip,label,group  (or ; from Excel in some locales)
-                cols = [c.strip() for c in line.split(delim)]
+            if "," in line.split(None, 1)[0]:  # CSV: ip,label,group
+                cols = [c.strip() for c in line.split(",")]
                 target = cols[0]
                 label = cols[1] if len(cols) > 1 and cols[1] else target
                 group = cols[2] if len(cols) > 2 and cols[2] else section
@@ -180,7 +171,7 @@ HOSTNAME_RE = re.compile(r"^(?=.{1,253}\.?$)[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Z
                          r"(\.[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)*\.?$")
 
 
-def validate_targets(hosts: list[Host], dns_timeout: float = 5.0):
+def validate_targets(hosts: list[Host]):
     """Sets h.addr (the IP to ping), or h.invalid (and state INVALID) for entries that can't be pinged.
 
     Hostnames are resolved exactly once, here. fping then only gets IPs, so it doesn't
@@ -200,7 +191,7 @@ def validate_targets(hosts: list[Host], dns_timeout: float = 5.0):
     if to_resolve:
         pool = ThreadPoolExecutor(max_workers=min(32, len(to_resolve)))
         futures = [(h, pool.submit(socket.getaddrinfo, h.target, None)) for h in to_resolve]
-        deadline = time.time() + dns_timeout
+        deadline = time.time() + 5.0  # for all names together
         for h, fut in futures:
             try:
                 infos = fut.result(timeout=max(0.0, deadline - time.time()))
@@ -219,29 +210,27 @@ def validate_targets(hosts: list[Host], dns_timeout: float = 5.0):
             h.state = INVALID
 
 
-# --------------------------------------------------------------------------- backends
+# --------------------------------------------------------------------------- fping
 
 class PingError(Exception):
     """The ping tool itself failed - the round's results can't be trusted."""
 
 
-FPING_SPACING_MS = 5  # ms between two probes of one fping process
-FPING_CHUNK = 64  # hosts per fping process; the processes run in parallel
-
-
 class FpingBackend:
-    """One fping process per chunk of hosts, chunks run in parallel."""
-    name = "fping"
+    """One fping process per chunk of hosts, up to `workers` of them run in parallel."""
 
-    def __init__(self, timeout_ms: int, spacing_ms: int, chunk: int, workers: int = 16):
+    def __init__(self, timeout_ms: int, spacing_ms: int = 5, chunk: int = 64, workers: int = 16):
         self.timeout_ms = timeout_ms
-        self.spacing_ms = spacing_ms
-        self.chunk = chunk
+        self.spacing_ms = spacing_ms  # ms between two probes of one fping process
+        self.chunk = chunk  # hosts per fping process
+        self.workers = workers
         self.bin = shutil.which("fping")
         self.pool = ThreadPoolExecutor(max_workers=workers)
 
     def round_time(self, n: int) -> float:
-        return self.timeout_ms / 1000 + min(n, self.chunk) * self.spacing_ms / 1000
+        """Worst case for n hosts (none answers): the chunks run in waves of `workers` processes."""
+        waves = max(1, math.ceil(n / (self.chunk * self.workers)))
+        return waves * (self.timeout_ms / 1000 + min(n, self.chunk) * self.spacing_ms / 1000)
 
     def _run(self, targets: list[str]) -> dict[str, float | None]:
         # -C1 -q: one probe per host, per-host summary "host : 1.23" or "host : -"
@@ -288,64 +277,59 @@ class FpingBackend:
 
 # --------------------------------------------------------------------------- reverse dns
 
-def ptr_lookup(ip: str) -> tuple[str, str | None]:
-    """One reverse lookup -> ("ok", name) / ("none", None) = definitive / ("retry", None) = no answer."""
+DNS_RATE = 10  # reverse DNS queries per second at most
+DNS_PAUSE_S = 60  # while the DNS server doesn't answer: one query per this many seconds
+DNS_MAX_TRIES = 5  # queries without a usable answer before a host is given up
+
+
+def ptr_lookup(ip: str) -> tuple[bool, str | None]:
+    """One reverse lookup -> (answered, name). "No PTR record" is an answer: (True, None).
+    (False, None) = no usable answer (timeout, SERVFAIL) - may work later."""
     try:
-        return "ok", socket.gethostbyaddr(ip)[0].rstrip(".") or None
+        return True, socket.gethostbyaddr(ip)[0].rstrip(".") or None
     except socket.herror as e:
         # h_errno: 1 HOST_NOT_FOUND, 4 NO_DATA = the DNS server answered "no PTR record"
-        # 2 TRY_AGAIN (timeout), 3 NO_RECOVERY (SERVFAIL) = no usable answer, may work later
-        return ("none", None) if e.errno in (1, 4) else ("retry", None)
+        # 2 TRY_AGAIN (timeout), 3 NO_RECOVERY (SERVFAIL) = no usable answer
+        return e.errno in (1, 4), None
     except socket.gaierror as e:
-        definitive = {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)}
-        return ("none", None) if e.errno in definitive else ("retry", None)
+        return e.errno in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)), None
     except UnicodeError:  # a PTR record that isn't a valid name - an answer, just a useless one
-        return "none", None
+        return True, None
     except OSError:
-        return "retry", None
+        return False, None
 
 
-def resolve_names(mon: "Monitor", rate: float, max_tries: int = 5, pause_s: float = 60.0):
-    """Reverse DNS for every host: one answered query per host, ever.
+def resolve_names(mon: "Monitor"):
+    """Reverse DNS for every host, until it gets an answer - then never again.
 
-    An answer ("name" or "no PTR record") is final and never asked again. Only when the
-    DNS server gives no usable answer (timeout, SERVFAIL) is that host tried again later,
-    at most max_tries times. After 3 unanswered queries in a row the DNS server counts as
-    unreachable: then only one probe per pause_s goes out until it answers again.
+    A host without a usable answer goes to the back of the queue; after DNS_MAX_TRIES it is
+    given up (shown by its IP). When 3 different hosts in a row get no answer, the DNS server
+    counts as unreachable (e.g. behind the migrated switch): then only one query per
+    DNS_PAUSE_S goes out until it answers again, and those probes use up no tries.
     """
     todo: deque[tuple[Host, int]] = deque()
     with mon.lock:
         for h in mon.hosts:
-            if h.invalid or not is_ip(h.target):
-                h.fqdn = None if h.invalid else h.target  # already a name: no query needed
-            else:
+            if not h.invalid and is_ip(h.target):
                 todo.append((h, 0))
+            elif not h.invalid:
+                h.fqdn = h.target  # already a name: no query needed
         mon.dns_pending = len(todo)
-    unanswered_in_row = 0
+    failing: set[int] = set()  # hosts (by order) without an answer since the last answer
     while todo and not mon.stop.is_set():
-        h, tries = todo.popleft()
         t0 = time.time()
-        status, name = ptr_lookup(h.addr)
-        tries += 1
-        if status == "retry" and tries < max_tries:
-            todo.append((h, tries))  # try the others first, this one again later
-            unanswered_in_row += 1
-        else:
-            unanswered_in_row = 0 if status != "retry" else unanswered_in_row
-            with mon.lock:
+        h, tries = todo.popleft()
+        answered, name = ptr_lookup(h.addr)
+        tries += not mon.dns_paused
+        failing = set() if answered else failing | {h.order}
+        with mon.lock:
+            if answered or tries >= DNS_MAX_TRIES:
                 h.fqdn = name
-                mon.dns_pending -= 1
-        if unanswered_in_row >= 3:  # DNS server not answering: one probe per pause, not a flood
-            with mon.lock:
-                mon.dns_paused = True
-            mon.stop.wait(pause_s)
-            continue
-        if mon.dns_paused and status != "retry":
-            with mon.lock:
-                mon.dns_paused = False
-        mon.stop.wait(max(0.0, 1.0 / rate - (time.time() - t0)))  # spread the queries out
-    with mon.lock:
-        mon.dns_paused = False
+            else:
+                todo.append((h, tries))  # try the others first, this one again later
+            mon.dns_pending = len(todo)
+            mon.dns_paused = len(failing) >= 3
+        mon.stop.wait(DNS_PAUSE_S if mon.dns_paused else max(0.0, 1 / DNS_RATE - (time.time() - t0)))
 
 
 def is_ip(target: str) -> bool:
@@ -359,26 +343,23 @@ def is_ip(target: str) -> bool:
 # --------------------------------------------------------------------------- monitor
 
 class Monitor:
-    def __init__(self, hosts: list[Host], backend, args):
+    def __init__(self, hosts: list[Host], backend, args, baseline_path: str):
         self.hosts = hosts
-        for h in hosts:
-            h.history = deque(maxlen=args.window)
-        self.by_addr: dict[str, list[Host]] = {}
-        for h in hosts:
-            if h.addr:
-                self.by_addr.setdefault(h.addr, []).append(h)
+        self.by_addr: dict[str, list[Host]] = {}  # IP -> hosts pinged through it (valid hosts only)
         self.groups: dict[str, list[Host]] = {}
         for h in hosts:
+            h.history = deque(maxlen=args.window)
             self.groups.setdefault(h.group, []).append(h)
+            if h.addr:
+                self.by_addr.setdefault(h.addr, []).append(h)
         self.backend = backend
         self.args = args
         self.lock = threading.Lock()
-        self.events: deque[Text] = deque(maxlen=500)
+        self.events: deque[Text] = deque(maxlen=args.events)
         self.started = time.time()
         self.rounds = 0
         self.last_round_s = 0.0
         self.view = "compact"  # "v" toggles detail
-        self.sort_problems = False  # "s" toggles (detail view)
         self.show_fqdn = False  # "n" toggles
         self.dns_pending = 0  # hosts still waiting for a reverse-DNS answer
         self.dns_paused = False  # DNS server not answering, only probing once a minute
@@ -388,16 +369,17 @@ class Monitor:
         self._last_error_event = 0.0  # when a PING ERROR was last written to the log
         self.last_round_end = 0.0
         self.notice = ("", 0.0)  # (text, expires) shown in the header
-        self.ignore_step = ""  # x dialog: "" closed, "pick" a group number, "confirm" by pressing it again
-        self.ignore_until = 0.0  # the dialog closes by itself at this time
+        # an open question: "" none, "reset" (r r), x dialog: "pick" a group number, "confirm" by pressing it again
+        self.ask = ""
+        self.ask_until = 0.0  # the question closes by itself at this time
         self.ignore_keys: dict[str, str] = {}  # number key -> group, shown next to the group lines
         self.ignore_preview: list[Host] = []  # the hosts the confirm step will ignore
         self.last_ignore: tuple[str, list[tuple[Host, dict]]] | None = None  # (group, snapshots) for undo
-        self.baseline_path = args.baseline
+        self.baseline_path = baseline_path
         self.baseline_seen: set[str] = set()
         self.baseline_dirty = False
-        self.logfile = open(args.log, "a", encoding="utf-8") if args.log else None
-        self.event(None, f"started: {len(hosts)} hosts in {len(self.groups)} groups via {backend.name}, "
+        self.logfile = open(args.log, "a", encoding="utf-8")
+        self.event(None, f"started: {len(hosts)} hosts in {len(self.groups)} groups via fping, "
                          f"window={args.window} warn>={args.warn} loss>={args.loss} down>={args.down}", "cyan")
         for h in hosts:
             if h.invalid:
@@ -447,41 +429,12 @@ class Monitor:
 
     # -- events
     def event(self, host: Host | None, msg: str, style: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        if host is None:
-            who = ""
-        elif host.label != host.target:
-            who = f"{host.label} ({host.target}) "
-        else:
-            who = f"{host.target} "
-        self.events.append(Text.assemble((ts + " ", "dim"), (who, "bold"), (msg, style)))
+        now = datetime.now()
+        who = host.who + " " if host else ""
+        self.events.append(Text.assemble((f"{now:%H:%M:%S} ", "dim"), (who, "bold"), (msg, style)))
         grp = f"[{host.group}] " if host else ""
-        line = f"{datetime.now().isoformat(timespec='seconds')} {grp}{who}{msg}"
-        if self.logfile:
-            self.logfile.write(line + "\n")
-            self.logfile.flush()
-        if self.args.headless:
-            print(line, flush=True)
-
-    def state_counts(self) -> dict[str, int]:
-        counts = {st: 0 for st in SEVERITY}
-        for h in self.hosts:
-            counts[h.state] += 1
-        return counts
-
-    def status_line(self) -> str:
-        counts = self.state_counts()
-        up, seen = self.back_counts()
-        not_back = [h.label for h in self.hosts if h.ever_up and not is_back(h)]
-        line = (f"{datetime.now().isoformat(timespec='seconds')} STATUS back {up}/{seen}  "
-                f"down {counts[DOWN]}  loss {counts[LOSS]}  warn {counts[WARN]}  silent {counts[NEVER]}  "
-                f"invalid {counts[INVALID]}  round #{self.rounds} {self.last_round_s:.1f}s")
-        problem = self.ping_problem()
-        if problem:
-            line += f"  !! {problem}"
-        if not_back:
-            line += "  not back: " + ", ".join(not_back[:15]) + (" …" if len(not_back) > 15 else "")
-        return line
+        self.logfile.write(f"{now.isoformat(timespec='seconds')} {grp}{who}{msg}\n")
+        self.logfile.flush()
 
     # -- state machine
     def _evaluate(self, h: Host) -> str:
@@ -559,7 +512,7 @@ class Monitor:
         while not self.stop.is_set():
             t0 = time.time()
             try:
-                results, errors = self.backend.round(targets) if targets else ({}, [])
+                results, errors = self.backend.round(targets)
                 if errors and not results:
                     raise PingError(errors[0])  # nothing worked: the whole round is lost
                 now = time.time()
@@ -605,36 +558,74 @@ class Monitor:
                 return f"STALE: no completed round for {fmt_dur(age)}"
         return ""
 
-    # -- ignore: the operator takes the DOWN hosts of a group out of the alarms (clients that went home)
-    def ignore_key(self, key: str | None) -> bool:
-        """The x dialog: x -> group number -> the same number again. True = the key was used here."""
+    # -- keys: q v n act at once; r and x ask a question first (Esc or ASK_TIMEOUT_S cancels it)
+    def key(self, key: str) -> bool:
+        """Handles one key. True = quit."""
         now = time.time()
         with self.lock:
-            if self.ignore_step and now > self.ignore_until:
-                self._ignore_close("ignore cancelled (no key for 5s)")
-            if not key:
+            if self.ask:
+                self._answer(key, now)
                 return False
-            if not self.ignore_step:
-                if key != "x":
-                    return False
+            self.notice = ("", 0.0)
+            if key == "q":
+                return True
+            if key == "r":
+                self._ask("reset", "press r again to RESET all stats, Esc cancels", now)
+            elif key == "x":
                 self._ignore_open(now)
-            elif self.ignore_step == "pick" and key == "u" and self.last_ignore:
-                self._ignore_close("")
-                self._undo_ignore()
-            elif self.ignore_step == "pick" and key in self.ignore_keys:
-                self._ignore_preview(key, now)
-            elif self.ignore_step == "confirm" and key in self.ignore_keys:
-                group, hosts = self.ignore_keys[key], [h for h in self.ignore_preview if h.state == DOWN]
-                self._ignore_close("")
-                if hosts:
-                    self._ignore(group, hosts, now)
-                    self.notice = (f'ignored {len(hosts)} hosts in "{group}" - x u undoes it', now + 5)
+            elif key == "v":
+                self.view = "detail" if self.view == "compact" else "compact"
+            elif key == "n":
+                if self.args.dns or self.show_fqdn:
+                    self.show_fqdn = not self.show_fqdn
                 else:
-                    self.notice = (f'no DOWN hosts left in "{group}" - nothing ignored', now + 3)
-            else:  # any other key cancels, and does nothing else
-                self._ignore_close("ignore cancelled")
-            return True
+                    self.notice = ("reverse DNS is off (--no-dns)", now + 3)
+        return False
 
+    def expire(self):
+        """Closes a question nobody answered."""
+        with self.lock:
+            if self.ask and time.time() > self.ask_until:
+                self._close(f"cancelled (no key for {ASK_TIMEOUT_S}s)")
+
+    def _ask(self, step: str, text: str, now: float):
+        self.ask, self.ask_until = step, now + ASK_TIMEOUT_S
+        self.notice = (text, self.ask_until)
+
+    def _close(self, notice: str = ""):
+        self.ask, self.ignore_keys, self.ignore_preview = "", {}, []
+        self.notice = (notice, time.time() + 3) if notice else ("", 0.0)
+
+    def _answer(self, key: str, now: float):
+        """A key while a question is open: its answer, Esc = cancel, anything else is ignored
+        (a stray key or arrow key must not answer or cancel it)."""
+        if key == "esc":
+            self._close("cancelled")
+        elif self.ask == "reset" and key == "r":
+            self._close("stats reset")
+            self._reset()
+        elif self.ask == "pick" and key == "u" and self.last_ignore:
+            self._close()
+            self._undo_ignore()
+        elif self.ask == "pick" and key in self.ignore_keys:
+            self._ignore_preview(key, now)
+        elif self.ask == "confirm" and key in self.ignore_keys:
+            group, hosts = self.ignore_keys[key], [h for h in self.ignore_preview if h.state == DOWN]
+            self._close()
+            if hosts:
+                self._ignore(group, hosts, now)
+                self.notice = (f'ignored {len(hosts)} hosts in "{group}" - x u undoes it', now + 5)
+            else:
+                self.notice = (f'no DOWN hosts left in "{group}" - nothing ignored', now + 3)
+
+    def _reset(self):
+        for h in self.hosts:
+            h.reset(keep_outage=True)
+        self.started = time.time()
+        self.rounds = 0
+        self.event(None, "stats reset", "cyan")
+
+    # -- ignore: the operator takes the DOWN hosts of a group out of the alarms (clients that went home)
     def _ignore_open(self, now: float):
         groups = [g for g, members in self.groups.items() if any(h.state == DOWN for h in members)]
         undo = (f"u = undo last ignore ({len(self.last_ignore[1])} in {self.last_ignore[0]})"
@@ -643,35 +634,29 @@ class Monitor:
             self.notice = ("no DOWN hosts to ignore", now + 3)
             return
         self.ignore_keys = {str((i + 1) % 10): g for i, g in enumerate(groups[:10])}  # 1..9, 0
-        self.ignore_step, self.ignore_until = "pick", now + IGNORE_CONFIRM_S
         self.view = "compact"  # the numbers are shown next to the group lines
         if groups:
             text = "IGNORE the DOWN hosts of a group: press its number"
             if len(groups) > 10:
                 text += f" (first 10 of {len(groups)} groups)"
-            text += (", " + undo if undo else "") + ", any other key cancels"
+            text += (", " + undo if undo else "") + ", Esc cancels"
         else:
-            text = f"no DOWN hosts to ignore - {undo}, any other key cancels"
-        self.notice = (text, self.ignore_until)
+            text = f"no DOWN hosts to ignore - {undo}, Esc cancels"
+        self._ask("pick", text, now)
 
     def _ignore_preview(self, key: str, now: float):
         group = self.ignore_keys[key]
         hosts = [h for h in self.groups[group] if h.state == DOWN]
         if not hosts:
-            self._ignore_close(f'no DOWN hosts left in "{group}"')
+            self._close(f'no DOWN hosts left in "{group}"')
             return
         downs = sorted(now - h.miss_streak_start for h in hosts if h.miss_streak_start)
         span = ""
         if downs:
             span = f" (down {fmt_dur(downs[0])}" + (f" to {fmt_dur(downs[-1])})" if len(downs) > 1 else ")")
-        self.ignore_step, self.ignore_until = "confirm", now + IGNORE_CONFIRM_S
         self.ignore_keys, self.ignore_preview = {key: group}, hosts
-        self.notice = (f'ignore {len(hosts)} DOWN hosts in "{group}"{span}? press {key} again to confirm',
-                       self.ignore_until)
-
-    def _ignore_close(self, notice: str):
-        self.ignore_step, self.ignore_keys, self.ignore_preview = "", {}, []
-        self.notice = (notice, time.time() + 3) if notice else ("", 0.0)
+        self._ask("confirm", f'ignore {len(hosts)} DOWN hosts in "{group}"{span}? '
+                             f'press {key} again to confirm, Esc cancels', now)
 
     def _ignore(self, group: str, hosts: list[Host], now: float):
         """No alarm, not in "back N/M", no stats - but still pinged, see _record."""
@@ -705,37 +690,23 @@ class Monitor:
         self.event(None, f"UNDO ignore: {restored} hosts in [{group}] are watched again", "cyan")
         self.notice = (f'undone: {restored} hosts in "{group}" are watched again', time.time() + 5)
 
-    def reset(self):
-        with self.lock:
-            for h in self.hosts:
-                h.reset()
-            self.started = time.time()
-            self.rounds = 0
-            self.event(None, "stats reset", "cyan")
-
     # -- rendering
-    def render(self, console: Console):
+    def render(self, width: int, height: int):
         with self.lock:
-            return self._render(console.size.width, console.size.height)
+            if self.view == "compact":
+                body, used = self._compact(width, height - 1)
+            else:  # every host as a cell, events get at most 3 lines
+                grid, used = self._cells(self.hosts, width, max(1, height - 1 - min(self.args.events, 3)),
+                                         with_target=False)
+                body = [grid]
+            parts = [self._header(width), *body]
+            self._append_events(parts, width, height - 1 - used)
+            return Group(*parts)
 
-    def _render(self, width: int, height: int):
-        header = self._header(width)
-        if self.view == "compact":
-            body, used = self._compact(width, height - 1)
-        else:
-            body, used = self._detail(width, height - 1 - min(self.args.events, 3))
-        parts = [header, *body]
-        self._append_events(parts, width, height - 1 - used)
-        return Group(*parts)
-
-    def back_counts(self) -> tuple[int, int]:
-        """(hosts reachable now = not DOWN, hosts that ever answered)"""
-        return sum(1 for h in self.hosts if is_back(h)), sum(1 for h in self.hosts if h.ever_up)
-
-    def _header(self, width: int = 200) -> Text:
+    def _header(self, width: int) -> Text:
         """Status line; the least important parts are dropped first when it doesn't fit."""
-        counts = self.state_counts()
-        up, seen = self.back_counts()
+        counts = Counter(h.state for h in self.hosts)
+        up, seen = back_counts(self.hosts)
         problem = self.ping_problem()
         notice, expires = self.notice
         # (priority, text, style) - higher priority is dropped first, 0 never
@@ -745,7 +716,7 @@ class Monitor:
         if notice and time.time() < expires:
             segs.append((0, f" {notice} ", "bold black on yellow"))
         segs += [
-            (0, f" back {up}/{seen} ", "bold black on green" if up == seen and seen else "bold white on red"),
+            (0, f" back {up}/{seen} ", "bold black on green" if all_back(up, seen) else "bold white on red"),
             (1, f"ok {counts[OK]}", "green"),
             (1, f"warn {counts[WARN]}", "yellow"),
             (1, f"loss {counts[LOSS]}", "red"),
@@ -761,9 +732,9 @@ class Monitor:
         if self.dns_pending:
             segs.append((3, f"dns no answer, {self.dns_pending} left (probing 1/min)" if self.dns_paused
                             else f"dns {self.dns_pending} left", "yellow" if self.dns_paused else "dim"))
-        segs.append((3, f"{self.backend.name} {fmt_dur(time.time() - self.started)} "
+        segs.append((3, f"fping {fmt_dur(time.time() - self.started)} "
                         f"#{self.rounds} {self.last_round_s:.1f}s", "dim"))
-        segs.append((4, "[q]uit [r]eset [v]iew [n]ames [x]ignore" + (" [s]ort" if self.view == "detail" else ""), "dim"))
+        segs.append((4, "[q]uit [r]eset [v]iew [n]ames [x]ignore", "dim"))
 
         keep = segs
         while sum(len(t) + 1 for _, t, _ in keep) > width:
@@ -801,8 +772,7 @@ class Monitor:
         lines: list[Text] = []
         for gname, members in self.groups.items():
             # up / hosts that ever answered (silent-from-the-start hosts don't count)
-            seen = sum(1 for h in members if h.ever_up)
-            up = sum(1 for h in members if is_back(h))
+            up, seen = back_counts(members)
             worst = min((h.state for h in members), key=SEVERITY.get)
             label = gname if len(gname) <= name_w else gname[: name_w - 1] + "…"
             for start in range(0, len(members), per_line):
@@ -813,7 +783,7 @@ class Monitor:
                         t.append(" ")
                     t.append(label.ljust(name_w) + " ", STATE_STYLES[worst][1] or "bold")
                     t.append(f"{up:>3}/{seen:<3} ",
-                             "green" if up == seen else STATE_STYLES[worst][0])
+                             "green" if all_back(up, seen) else STATE_STYLES[worst][0])
                 else:
                     t.append(" " * prefix_w)
                 for i, h in enumerate(members[start:start + per_line]):
@@ -823,12 +793,12 @@ class Monitor:
                 lines.append(t)
 
         problems = sorted((h for h in self.hosts if h.state in (DOWN, LOSS, WARN, INVALID)),
-                          key=problem_order)
+                          key=lambda h: (SEVERITY[h.state], -h.window_lost, h.order))  # worst first
         free = height - len(lines)
         # problems get the rows they need at full detail; events get what's left (min 2 lines)
         if problems:
-            name_w, hist_w, _ = CELL_LAYOUTS[0]
-            full_cols = max(1, (width + 1) // (2 + name_w + 16 + 5 + 1 + hist_w + 1))
+            name_w, hist_w, show_pct = CELL_LAYOUTS[0]
+            full_cols = max(1, (width + 1) // (cell_width(name_w + 16, hist_w, show_pct) + 1))
             wanted = math.ceil(len(problems) / full_cols)
             reserve = min(self.args.events, max(2, free - 1 - wanted))
         else:
@@ -847,27 +817,14 @@ class Monitor:
                 used += rows
         return out, used
 
-    # detail view: every host as a cell, auto-fit
-    def _detail(self, width: int, height: int) -> tuple[list, int]:
-        hosts = self.hosts
-        if self.sort_problems:
-            hosts = sorted(hosts, key=problem_order)
-        grid, rows = self._cells(hosts, width, max(1, height), with_target=False)
-        return [grid], rows
-
     def _cells(self, hosts: list[Host], width: int, max_rows: int, with_target: bool):
         """Grid of host cells using the most detailed layout that fits in max_rows."""
-        # Size from BOTH name variants, so toggling label/FQDN keeps every host in the same
-        # cell. While PTR answers are still arriving, reserve the maximum width instead
-        # (not while DNS is unreachable - that can last, so size from the names we have).
-        if self.dns_pending and not self.dns_paused:
-            name_len = 10_000
-        else:
-            name_len = max(max(len(self._name(h, with_target, fqdn=False)),
-                               len(self._name(h, with_target, fqdn=True))) for h in hosts)
+        # size from BOTH name variants, so toggling label/FQDN keeps every host in the same cell
+        name_len = max(max(len(self._name(h, with_target, fqdn=False)),
+                           len(self._name(h, with_target, fqdn=True))) for h in hosts)
         for name_w, hist_w, show_pct in CELL_LAYOUTS:
             name_w = min(name_w + (16 if with_target else 0), max(4, name_len))
-            cell_w = 2 + name_w + (5 if show_pct else 0) + (1 + hist_w if hist_w else 0)
+            cell_w = cell_width(name_w, hist_w, show_pct)
             cols = max(1, (width + 1) // (cell_w + 1))
             if cols * max_rows >= len(hosts):
                 break
@@ -921,6 +878,12 @@ class Monitor:
 UNDO_FIELDS = ("sent", "lost", "consec_miss", "miss_streak_start", "state", "outages", "longest_outage",
                "ever_up", "from_baseline")
 
+
+def cell_width(name_w: int, hist_w: int, show_pct: bool) -> int:
+    """Characters of one host cell: dot + name + loss % + recent pings."""
+    return 2 + name_w + (5 if show_pct else 0) + (1 + hist_w if hist_w else 0)
+
+
 # (name width, history width, show loss %) from most to least detailed
 CELL_LAYOUTS = [(18, 20, True), (16, 15, True), (14, 10, True), (12, 8, True), (12, 5, True),
                 (10, 0, True), (8, 0, True), (6, 0, True), (6, 0, False), (4, 0, False)]
@@ -951,10 +914,7 @@ SPARK = [(1, "▁"), (2, "▂"), (5, "▃"), (10, "▄"), (30, "▅"), (100, "�
 
 
 def spark(rtt: float) -> tuple[str, str]:
-    for limit, ch in SPARK:
-        if rtt < limit:
-            return ch, ("green" if rtt < 30 else "yellow")
-    return "▇", "yellow"
+    return next(ch for limit, ch in SPARK if rtt < limit), ("green" if rtt < 30 else "yellow")
 
 
 def fmt_dur(sec: float) -> str:
@@ -966,6 +926,11 @@ def fmt_dur(sec: float) -> str:
 
 # --------------------------------------------------------------------------- keyboard
 
+# one key: an escape sequence (arrow keys, F-keys: ESC [ ... or ESC O x), a lone ESC, or one character
+KEY_SEQ = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|O.)?|.", re.S)
+KEY_SEQ_OPEN = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*|O)?\Z")  # input ends inside an escape sequence
+
+
 class Keyboard:
     """Single-key input without Enter (POSIX terminals only)."""
 
@@ -975,47 +940,64 @@ class Keyboard:
 
     def __enter__(self):
         if self.enabled:
-            import termios
-            import tty
             self.old = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin.fileno())
         return self
 
     def __exit__(self, *exc):
         if self.old is not None:
-            import termios
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old)
 
-    def get(self, timeout: float) -> str | None:
+    def keys(self, timeout: float) -> list[str]:
+        """The keys pressed within timeout, lower case, Esc as "esc". Escape sequences
+        (arrow keys, F-keys) are dropped, so they can't answer or cancel anything."""
         if not self.enabled:
             time.sleep(timeout)
-            return None
+            return []
         ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        return os.read(sys.stdin.fileno(), 1).decode(errors="ignore") if ready else None
+        if not ready:
+            return []
+        data = os.read(sys.stdin.fileno(), 64)
+        if not data:  # stdin closed: stop reading, or select would return at once forever
+            self.enabled = False
+        # a slow link can split an arrow key: wait briefly for the rest, or its ESC counts as Esc
+        while KEY_SEQ_OPEN.search(data) and select.select([sys.stdin], [], [], 0.1)[0]:
+            more = os.read(sys.stdin.fileno(), 64)
+            if not more:
+                break
+            data += more
+        data = data.decode(errors="ignore")
+        return ["esc" if k == "\x1b" else k.lower() for k in KEY_SEQ.findall(data)
+                if k == "\x1b" or not k.startswith("\x1b")]
 
 
 # --------------------------------------------------------------------------- main
 
 def print_summary(console: Console, mon: Monitor):
     """After exit: every host that lost anything, worst first, plus per-group totals."""
-    up, seen = mon.back_counts()
+    def host_line(h: Host, color: str, rest: str):
+        console.print(f"  [{color}]{h.target:<16}[/{color}] {h.fqdn or h.label:<30} {rest}")
+
+    up, seen = back_counts(mon.hosts)
     console.print(f"\n[bold]Summary[/bold] - {fmt_dur(time.time() - mon.started)}, {mon.rounds} rounds, "
-                  f"[{'green' if up == seen else 'bold red'}]back {up}/{seen}[/] hosts that answered at some point")
+                  f"[{'green' if all_back(up, seen) else 'bold red'}]back {up}/{seen}[/] "
+                  f"hosts that answered at some point")
     gt = Table(header_style="bold")
     for col in ("group", "hosts", "back", "not back", "silent", "ignored", "with loss", "outages", "loss %"):
         gt.add_column(col, justify="left" if col == "group" else "right")
     for gname, members in mon.groups.items():
+        back, seen_n = back_counts(members)
         seen_m = [h for h in members if h.ever_up]
-        back = sum(1 for h in seen_m if is_back(h))
         sent = sum(h.sent for h in seen_m)
         lost = sum(h.lost for h in seen_m)
         affected = sum(1 for h in seen_m if h.lost)
         outages = sum(h.outages for h in seen_m)
-        gt.add_row(gname, str(len(members)), str(back), str(len(seen_m) - back),
+        gt.add_row(gname, str(len(members)), str(back), str(seen_n - back),
                    str(sum(1 for h in members if h.state == NEVER)),
                    str(sum(1 for h in members if h.state == IGNORED)), str(affected), str(outages),
                    f"{100.0 * lost / sent if sent else 0:.2f}",
-                   style="bold red" if back < len(seen_m) else ("yellow" if affected else "green"))
+                   style="bold red" if back < seen_n else ("yellow" if affected else
+                                                           "green" if seen_n else "dim"))
     console.print(gt)
 
     problem = mon.ping_problem()
@@ -1026,13 +1008,12 @@ def print_summary(console: Console, mon: Monitor):
         console.print(f"[bold red]NOT BACK ({len(not_back)}):[/bold red] answered earlier, not answering now")
         for h in not_back:
             note = "  (known from baseline, no reply in this run)" if h.from_baseline and h.sent == h.lost else ""
-            name = h.fqdn or h.label
-            console.print(f"  [red]{h.target:<16}[/red] {name:<30} [dim]{h.group}[/dim]  {h.state}{note}")
+            host_line(h, "red", f"[dim]{h.group}[/dim]  {h.state}{note}")
     invalid = [h for h in mon.hosts if h.invalid]
     if invalid:
         console.print(f"[bold magenta]INVALID entries, not pinged ({len(invalid)}):[/bold magenta]")
         for h in invalid:
-            console.print(f"  [magenta]{h.target:<16}[/magenta] {h.label:<24} [dim]{h.where}[/dim]  {h.invalid}")
+            host_line(h, "magenta", f"[dim]{h.where}[/dim]  {h.invalid}")
     ignored = [h for h in mon.hosts if h.ignore_log]
     if ignored:
         still = sum(1 for h in ignored if h.ignored_at is not None)
@@ -1043,15 +1024,15 @@ def print_summary(console: Console, mon: Monitor):
                              + (f" back {datetime.fromtimestamp(back):%H:%M}" if back else "")
                              for at, back in h.ignore_log)
             status = "still ignored" if h.ignored_at is not None else f"back, {h.state}"
-            name = h.fqdn or h.label
-            console.print(f"  [yellow]{h.target:<16}[/yellow] {name:<30} [dim]{h.group}[/dim]  {status}  [dim]{when}[/dim]")
+            host_line(h, "yellow", f"[dim]{h.group}[/dim]  {status}  [dim]{when}[/dim]")
     silent = [h for h in mon.hosts if not h.ever_up and not h.invalid and h.ignored_at is None]
     if silent:
         console.print(f"[dim]Silent the whole time ({len(silent)}): "
-                      + ", ".join(h.label if h.label == h.target else f"{h.label} ({h.target})" for h in silent)
-                      + "[/dim]")
+                      + ", ".join(h.who for h in silent) + "[/dim]")
 
-    bad = sorted((h for h in mon.hosts if h.ever_up and h.lost), key=lambda h: (-h.outages, -h.lost, h.order))
+    # h.outages without h.lost: DOWN at an r r reset, back before it missed another ping
+    bad = sorted((h for h in mon.hosts if h.ever_up and (h.lost or h.outages)),
+                 key=lambda h: (-h.outages, -h.lost, h.order))
     if not bad:
         console.print("[green]No packet loss on any responding host.[/green]")
         return
@@ -1097,19 +1078,13 @@ def main():
     ap.add_argument("--warn", type=int, default=2, help="lost in window -> WARN (default 2)")
     ap.add_argument("--loss", type=int, default=3, help="lost in window -> LOSS (default 3)")
     ap.add_argument("--down", type=int, default=3, help="consecutive misses -> DOWN (default 3)")
-    ap.add_argument("--events", type=int, default=8, help="max event log lines (default 8, 0=off)")
-    ap.add_argument("--log", default="pingT-events.log", help="append events to this file (default pingT-events.log)")
-    ap.add_argument("--no-log", dest="log", action="store_const", const=None, help="don't write an event log")
-    ap.add_argument("--headless", action="store_true",
-                    help="no TUI: print events + a status line to stdout (for nohup / background)")
-    ap.add_argument("--status", type=float, default=30, help="headless: seconds between status lines (default 30)")
-    ap.add_argument("--baseline", help="file remembering which hosts ever answered "
-                                       "(default: next to the log, <log>-baseline.json)")
+    ap.add_argument("--events", type=int, default=8, help="event lines on screen (default 8, 0=off)")
+    ap.add_argument("--log", default="pingT-events.log",
+                    help="append events to this file (default pingT-events.log); "
+                         "the summary and baseline files are named after it")
     ap.add_argument("--fresh", action="store_true", help="ignore the saved baseline and start a new one")
     ap.add_argument("--no-dns", dest="dns", action="store_false",
                     help="no reverse DNS lookups at all")
-    ap.add_argument("--dns-rate", type=float, default=20.0,
-                    help="max reverse DNS queries per second (default 10, one query per host total)")
     args = ap.parse_args()
 
     checks = [
@@ -1119,19 +1094,13 @@ def main():
         (args.interval >= 0.2, "-i/--interval must be >= 0.2 s"),
         (50 <= args.timeout <= 10000, "-t/--timeout must be 50..10000 ms"),
         (args.events >= 0, "--events must be >= 0"),
-        (args.status >= 1, "--status must be >= 1 s"),
-        (args.dns_rate > 0, "--dns-rate must be > 0"),
     ]
     for ok, msg in checks:
         if not ok:
             ap.error(msg)
     if not shutil.which("fping"):
         ap.error("fping not found in PATH - install it first (apt install fping)")
-    out_dir = os.path.dirname(os.path.abspath(args.log)) if args.log else os.getcwd()
-    stem = os.path.splitext(os.path.basename(args.log))[0] if args.log else "pingT"
-    if not args.baseline:
-        args.baseline = os.path.join(out_dir, f"{stem}-baseline.json")
-    summary_path = os.path.join(out_dir, f"{stem}-summary-{datetime.now():%Y%m%d-%H%M%S}.txt")
+    stem = os.path.splitext(os.path.abspath(args.log))[0]  # pingT-events -> -baseline.json, -summary-...
 
     entries = []
     for path in args.file:
@@ -1155,83 +1124,51 @@ def main():
     if len(invalid) == len(hosts):
         ap.error("no valid hosts to ping")
 
-    backend = FpingBackend(args.timeout, FPING_SPACING_MS, FPING_CHUNK)
+    backend = FpingBackend(args.timeout)
     needed = backend.round_time(len(hosts) - len(invalid))  # worst case: every host times out
     if needed > 1.5 * args.interval:
         print(f"note: with many hosts down a round can take ~{needed:.1f}s > interval {args.interval}s; "
               f"rounds then run back-to-back", file=sys.stderr)
-    if invalid and not args.headless and sys.stdin.isatty():
+    if invalid and sys.stdin.isatty():
         time.sleep(3)  # let the warnings be read before the dashboard takes over the screen
 
     def on_signal(*_):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, on_signal)  # kill -> still save the summary
-    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:  # keep nohup's "ignore hangup"
-        signal.signal(signal.SIGHUP, on_signal)  # SSH session dropped -> still save the summary
+    signal.signal(signal.SIGHUP, on_signal)  # SSH session dropped -> still save the summary
 
     console = Console()
     try:
-        mon = Monitor(hosts, backend, args)
+        mon = Monitor(hosts, backend, args, f"{stem}-baseline.json")
     except OSError as e:
         ap.error(f"cannot open log file: {e}")
     ping_thread = threading.Thread(target=mon.run_pings, daemon=True)
     ping_thread.start()
     if args.dns:
-        threading.Thread(target=resolve_names, args=(mon, args.dns_rate), daemon=True).start()
+        threading.Thread(target=resolve_names, args=(mon,), daemon=True).start()
 
     try:
-        if args.headless:
-            while True:
-                time.sleep(args.status)
-                with mon.lock:
-                    line = mon.status_line()
-                    print(line, flush=True)
-                    if mon.logfile:
-                        mon.logfile.write(line + "\n")
-                        mon.logfile.flush()
-        reset_armed_until = 0.0
         with Keyboard() as kb, Live(console=console, screen=True, auto_refresh=False) as live:
             while True:
-                live.update(mon.render(console), refresh=True)
-                key = (kb.get(0.5) or "").lower()
-                if mon.ignore_key(key):  # the x dialog (also closes it after its timeout)
-                    reset_armed_until = 0.0
-                    continue
-                if not key:
-                    continue
-                if key == "r" and time.time() < reset_armed_until:
-                    mon.reset()
-                    reset_armed_until = 0.0
-                    mon.notice = ("stats reset", time.time() + 3)
-                    continue
-                reset_armed_until = 0.0  # any other key cancels a pending reset
-                mon.notice = ("", 0.0)
-                if key == "q":
+                live.update(mon.render(*console.size), refresh=True)
+                keys = kb.keys(0.5)
+                mon.expire()  # first, so a late key can't answer a question that timed out
+                if any(mon.key(k) for k in keys):  # True = q
                     break
-                if key == "r":
-                    reset_armed_until = time.time() + 3
-                    mon.notice = ("press r again within 3s to RESET all stats", reset_armed_until)
-                if key == "v":
-                    mon.view = "detail" if mon.view == "compact" else "compact"
-                if key == "n":
-                    if args.dns or mon.show_fqdn:
-                        mon.show_fqdn = not mon.show_fqdn
-                    else:
-                        mon.notice = ("reverse DNS is off (--no-dns)", time.time() + 3)
-                if key == "s":
-                    mon.sort_problems = not mon.sort_problems
     except (KeyboardInterrupt, OSError):  # OSError: terminal went away
         pass
     finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # a 2nd signal must not cut the summary short
+            signal.signal(sig, signal.SIG_IGN)
         mon.stop.set()
         ping_thread.join(timeout=backend.round_time(len(hosts)) + 5)
+        summary_path = f"{stem}-summary-{datetime.now():%Y%m%d-%H%M%S}.txt"  # named when it stops
         with mon.lock:
             mon.event(None, "stopped", "cyan")
             err = save_summary(mon, summary_path)  # file first - the terminal may be gone
             try:
                 print_summary(console, mon)
-                if args.log:
-                    console.print(f"[dim]events logged to {os.path.abspath(args.log)}[/dim]")
+                console.print(f"[dim]events logged to {os.path.abspath(args.log)}[/dim]")
                 console.print(f"[dim]summary saved to {summary_path}[/dim]" if not err
                               else f"[red]could not save summary: {err}[/red]")
             except OSError:

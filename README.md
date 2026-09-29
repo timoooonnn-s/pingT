@@ -84,9 +84,12 @@ Clients 2F      73/76  ●X●●●●●●●● ●●●●●●●●●�
 | `q` | quit (summary is printed and saved) |
 | `v` | switch view: groups ↔ every host as its own box |
 | `n` | show DNS names instead of your labels (and back) |
-| `s` | in the box view: problems first |
 | `r` `r` | reset the loss counters (press twice) |
 | `x` | ignore the down hosts of a group: `x`, group number, the same number again (`x` `u` = undo) |
+| `Esc` | cancel a question (`r`, `x`) |
+
+While `r` or `x` waits for its answer, other keys (arrow keys too) do nothing — only the answer,
+`Esc`, or 5 seconds without a key close it.
 
 ---
 
@@ -129,7 +132,7 @@ them out, one group at a time:
 1. Press **`x`**. Every group with down hosts gets a number next to its line.
 2. Press the group's **number**. The top line asks, e.g.
    `ignore 23 DOWN hosts in "Clients 2F" (down 4:12 to 1:35:00)? press 2 again to confirm`
-3. Press the **same number again**. Any other key, or 5 seconds without a key, cancels.
+3. Press the **same number again**. `Esc`, or 5 seconds without a key, cancels.
 
 Only the hosts that are **down right now** are ignored, and only in that group. They get a
 grey `-`, raise no alarm and don't count in `back`. The top line shows `ignored N`.
@@ -213,7 +216,6 @@ Everything in detail. You don't need this to use the tools.
 - [Files pingT writes](#files-pingt-writes)
 - [Remembering hosts across restarts](#remembering-hosts-across-restarts)
 - [DNS names](#dns-names)
-- [Running without the screen (background)](#running-without-the-screen-background)
 - [How often hosts are pinged](#how-often-hosts-are-pinged)
 - [Troubleshooting](#troubleshooting)
 - [For the maintainer](#for-the-maintainer)
@@ -235,13 +237,8 @@ Everything in detail. You don't need this to use the tools.
 | `--loss N` | `3` | lost pings (out of the last `-w`) until red |
 | `--down N` | `3` | lost pings **in a row** until down |
 | `--events N` | `8` | lines of the event list on screen (0 = hide) |
-| `--log FILE` | `pingT-events.log` | event log file |
-| `--no-log` | | don't write an event log |
-| `--baseline FILE` | next to the log | where to remember which hosts were online |
+| `--log FILE` | `pingT-events.log` | event log file; the summary and baseline files are named after it |
 | `--no-dns` | | don't look up DNS names |
-| `--dns-rate N` | `10` | max DNS lookups per second |
-| `--headless` | | no screen, only text lines (see [background](#running-without-the-screen-background)) |
-| `--status SEC` | `30` | with `--headless`: seconds between status lines |
 
 The thresholds must fit together: `1 <= --warn <= --loss <= -w`.
 
@@ -258,14 +255,12 @@ The thresholds must fit together: `1 <= --warn <= --loss <= -w`.
 | `--merge FILE` | | take names from an existing host list and keep its devices (see [the scanner](#the-scanner-optional)) |
 | `--drop-missing` | | with `--merge`: leave out devices that didn't answer |
 | `--then-ping` | | start pingT with the new list right after the scan |
-| `-p N` | `3` | scan rounds; later rounds only re-try the addresses that didn't answer |
 | `-t MS` | `500` | how long to wait for a reply |
 | `--rate N` | `400` | max pings per second in total |
-| `--chunk N` | `256` | max addresses per fping process |
-| `--csv FILE` | | also write details per host: subnet, group, round it was found in, fastest reply |
-| `--all-addresses` | | also ping the network and broadcast address of each subnet |
 | `--force` | | allow subnets bigger than `/16` or more than 262,144 addresses in one scan |
 
+- **Rounds:** every address is pinged in round 1; rounds 2 and 3 only re-try the addresses
+  that didn't answer. The network and broadcast address of a subnet are skipped.
 - **Speed:** all subnets are scanned together. Worst case (nothing answers): one `/24`
   ~4 s, three `/24` ~8 s. For big scans `--rate` sets the pace: 2,500 addresses ~8 s per round.
 - **Rate:** scanning unused addresses makes the router look up (ARP) every one of them —
@@ -273,7 +268,7 @@ The thresholds must fit together: `1 <= --warn <= --loss <= -w`.
 - **Size limit:** a subnet above `/16` is refused (a typo like `/8` would mean 16 million
   addresses). `--force` overrides it.
 - **Overlapping subnets:** each address is scanned once and belongs to the first subnet
-  that contains it.
+  that contains it. Subnets with the same group name end up in one `[group]`.
 - **Ctrl-C** (or repeated fping errors) stops the scan and writes what was found to
   `FILE.partial` — your host list is **not** changed.
 - **`--merge` in detail:** devices that answered get the name from the old list. Devices
@@ -301,7 +296,9 @@ pingT looks at the last 20 pings of each host (`-w`).
   green right away. The outage is still in the event log and the summary.
 - A host counts as **back** when it's not down — a host that loses some pings is back.
 - `r` `r` resets the loss counters (to measure only the time after the cut-over).
-  Note: it also clears the outages from the summary; the event log still has them.
+  Note: it also clears finished outages from the summary; the event log still has them.
+  Hosts that are down at that moment stay down, and their outage still counts from when it
+  started.
 
 ## The screen in detail
 
@@ -343,7 +340,6 @@ Green below 30 ms, yellow above.
 10.0.10.11                        # IP only
 switch01.corp.local   sw01        # a DNS name also works
 10.0.20.7,printer-2f,Office       # comma format: ip,name,group
-10.0.20.8;pc-2f-08;Office         # the same with ";" (Excel)
 []                                # ends the group
 10.0.50.7                         # no group: grouped by its /24 -> "10.0.50.0/24"
 ```
@@ -353,8 +349,8 @@ switch01.corp.local   sw01        # a DNS name also works
 - Lines with typos or unknown names are shown as invalid and skipped — pingT still starts.
 - DNS names are looked up **once** at start; pingT then pings the IP. If a name gets a
   new IP during the run, restart pingT.
-- Examples: [hosts.example.txt](hosts.example.txt),
-  [inventory.example.txt](inventory.example.txt) (188 public IPs for trying it out).
+- Example: [hosts.example.txt](hosts.example.txt). To just try pingT out, list a few
+  IPs directly: `./pingT 1.1.1.1 8.8.8.8`
 
 ## Files pingT writes
 
@@ -363,11 +359,12 @@ In the folder you start pingT from:
 | File | Content |
 |---|---|
 | `pingT-events.log` | every event with date and time — added to on every run |
-| `pingT-events-summary-<date>-<time>.txt` | the summary, saved every time pingT stops |
+| `pingT-events-summary-<date>-<time>.txt` | the summary, saved every time pingT stops (named with the time it stopped) |
 | `pingT-events-baseline.json` | which hosts were online (for restarts) |
 
 With `--log other.log` the files are named `other…` instead of `pingT-events…`.
-With `--no-log` they are named `pingT-summary-…` and `pingT-baseline.json`.
+
+The summary is also saved on Ctrl-C, `kill`, or when the SSH session drops.
 
 ## Remembering hosts across restarts
 
@@ -382,38 +379,22 @@ With `--no-log` they are named `pingT-summary-…` and `pingT-baseline.json`.
 `n` shows the DNS name (reverse lookup) instead of your label — or the IP if there
 is no DNS name.
 
-- **One lookup per host, for the whole run.** The answer is kept; nothing is asked
-  again. Lookups are spread out (max 10 per second, `--dns-rate`): 255 hosts take ~25 s.
-- If the DNS server doesn't answer (e.g. because it's behind the switch you're
-  migrating), pingT sends only **one lookup per minute** until it answers again. The
-  top line then shows `dns no answer … (probing 1/min)`.
+- **One answer per host, for the whole run.** The answer is kept; nothing is asked
+  again. Lookups are spread out (max 10 per second): 255 hosts take ~25 s.
+- A host that gets no answer (timeout) is asked again later, up to 5 times; after
+  that pingT gives up on it and shows its IP.
+- If 3 different hosts in a row get no answer, the DNS server itself counts as down
+  (e.g. because it's behind the switch you're migrating). pingT then sends only
+  **one lookup per minute** until it answers again — those don't count toward the 5.
+  The top line shows `dns no answer … (probing 1/min)`.
 - Hosts written as DNS names in the host list are not looked up again.
 - `--no-dns` turns it off.
-
-## Running without the screen (background)
-
-The easiest way is `tmux` or `screen`. Without them:
-
-```bash
-nohup ./pingT -f hosts.txt --headless > migration-run.txt 2>&1 &
-tail -f migration-run.txt     # watch: events + a status line every 30 s
-kill <pid>                    # stop: the summary goes into the file and is saved
-```
-
-A status line looks like this:
-
-```
-2026-09-22T14:05:00 STATUS back 265/268  down 3  loss 1  warn 0  silent 12  invalid 0  round #3712 1.1s  not back: clients-01, clients-39, clients-60
-```
-
-Use `--headless` whenever there is no terminal — otherwise the screen output fills the
-file. The summary is also saved on Ctrl-C, `kill`, or when the SSH session drops.
 
 ## How often hosts are pinged
 
 - Every round pings every host once. A new round starts every second (`-i`).
-- Up to 64 hosts share one fping process; the processes run in parallel. 255 hosts
-  are all pinged within about 0.3 s.
+- Up to 64 hosts share one fping process; up to 16 processes run in parallel (1,024
+  hosts). 255 hosts are all pinged within about 0.3 s.
 - If all hosts answer, each host gets one ping per second. If some are down, pingT
   waits for their timeout (800 ms), so a round takes ~1.1 s.
 - A host is therefore marked down about 3–3.5 s after it stops answering.
