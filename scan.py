@@ -33,16 +33,12 @@ import sys
 import time
 from datetime import datetime
 
-if __name__ == "__main__":  # started as ./scan.py: switch to the project's .venv before importing rich
-    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-    from venvboot import use_project_venv
-    use_project_venv(__file__)
+# pingt first: it stops with a clear message if 'rich' is missing
+from pingt import INLINE_COMMENT, FpingBackend, auto_group, fmt_dur, is_ip, parse_hosts_file
 
-from rich.console import Console  # noqa: E402
-from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn  # noqa: E402
-from rich.table import Table  # noqa: E402
-
-from pingt import INLINE_COMMENT, FpingBackend, auto_group, fmt_dur, is_ip, parse_hosts_file  # noqa: E402
+from rich.console import Console
+from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
+from rich.table import Table
 
 WORKERS = 4  # parallel fping processes; --rate is split across them
 MAX_SUBNET = 65536  # addresses per subnet without --force (= a /16)

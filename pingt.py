@@ -54,10 +54,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from rich.console import Console, Group
-from rich.live import Live
-from rich.table import Table
-from rich.text import Text
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.table import Table
+    from rich.text import Text
+except ModuleNotFoundError as e:
+    if (e.name or "").split(".")[0] != "rich":
+        raise  # some other module is missing: show the real error
+    # a clear hint instead of a traceback - also covers scan.py, which imports this module first
+    sys.exit(f"{os.path.basename(sys.argv[0])}: the Python package 'rich' is missing in the Python that runs it:\n"
+             f"  {sys.executable}\n"
+             "Activate your Python environment (the one with 'rich' installed) and start it again.")
 
 # --------------------------------------------------------------------------- hosts
 

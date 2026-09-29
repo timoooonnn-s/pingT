@@ -401,6 +401,7 @@ file. The summary is also saved on Ctrl-C, `kill`, or when the SSH session drops
 | `invalid` hosts at the top | Typos or unknown names in the host list; shown with file and line number. |
 | `dns no answer … (probing 1/min)` | The DNS server doesn't answer. Names appear once it does. |
 | `note: … a round can take ~Xs` at start | Harmless: with many hosts down, rounds take a bit longer than 1 s. |
+| `… the Python package 'rich' is missing …` | You started it without your Python environment. Activate it (the one with `rich` installed) and start again. |
 | `Permission denied` when starting `./pingT` | The file lost its "executable" flag while copying: `chmod +x pingT scan.py`. |
 | Scanner: `… more than a /16` | Protection against typos. Split the range or add `--force`. |
 | Scanner: `FILE.partial` appeared | A scan was interrupted; your host list was not changed. Run the scan again. |
@@ -417,6 +418,5 @@ file. The summary is also saved on Ctrl-C, `kill`, or when the SSH session drops
 | `pingT` | start script for the pinger |
 | `pingt.py` | the pinger's code |
 | `scan.py` | the scanner |
-| `venvboot.py` | if a `.venv` folder exists next to the scripts, `./pingT` and `./scan.py` use it automatically |
 | `*.example.txt` | example host and subnet lists |
 | `.gitignore` | keeps logs, summaries, backups and users' own `hosts.txt` / `subnets.txt` / `inventory.txt` out of git |
