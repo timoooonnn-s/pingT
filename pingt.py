@@ -704,7 +704,7 @@ class Monitor:
             return Group(*parts)
 
     def _header(self, width: int) -> Text:
-        """Status line; the least important parts are dropped first when it doesn't fit."""
+        """Top line; the least important parts are dropped first when it doesn't fit."""
         counts = Counter(h.state for h in self.hosts)
         up, seen = back_counts(self.hosts)
         problem = self.ping_problem()

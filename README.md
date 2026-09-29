@@ -313,6 +313,7 @@ pingT looks at the last 20 pings of each host (`-w`).
 | `invalid` | host list lines that can't be pinged (only shown if there are any) |
 | `names:label` / `names:FQDN` | which names are shown (`n` switches) |
 | `dns N left` | DNS name lookups still running |
+| `dns no answer, N left (probing 1/min)` | the DNS server doesn't answer (see [DNS names](#dns-names)) |
 | `fping 1:02:13 #3712 1.1s` | runtime, number of ping rounds, duration of the last round |
 | purple `PING ERROR …` / `STALE …` | pinging itself has a problem — the screen may be out of date (see [troubleshooting](#troubleshooting)) |
 
@@ -354,7 +355,7 @@ switch01.corp.local   sw01        # a DNS name also works
 
 ## Files pingT writes
 
-In the folder you start pingT from:
+Next to the event log — with the default `--log`, in the folder you start pingT from:
 
 | File | Content |
 |---|---|
@@ -411,7 +412,7 @@ is no DNS name.
 | Purple **`STALE`** at the top | No ping round finished for a while — the screen is out of date. |
 | Switches/routers show some lost pings | They limit how many pings they answer. Try `-i 2`, or higher `--warn`/`--loss`. |
 | Many hosts grey (silent) | They haven't answered since pingT started: switched off, or blocking ping. Start pingT earlier. |
-| After a restart everything is grey | You started with `--fresh`, or from another folder (the baseline file is in the folder you start from). |
+| After a restart everything is grey | You started with `--fresh`, or from another folder, or with another `--log` (the baseline file is next to the event log). |
 | `invalid` hosts at the top | Typos or unknown names in the host list; shown with file and line number. |
 | `dns no answer … (probing 1/min)` | The DNS server doesn't answer. Names appear once it does. |
 | `note: … a round can take ~Xs` at start | Harmless: with many hosts down, rounds take a bit longer than 1 s. |
@@ -432,5 +433,6 @@ is no DNS name.
 | `pingT` | start script for the pinger |
 | `pingt.py` | the pinger's code |
 | `scan.py` | the scanner |
-| `*.example.txt` | example host and subnet lists |
-| `.gitignore` | keeps logs, summaries, backups and users' own `hosts.txt` / `subnets.txt` / `inventory.txt` out of git |
+| `requirements.txt` | the Python package pingT needs (`rich`) |
+| `hosts.example.txt` / `subnets.example.txt` | example host and subnet lists |
+| `.gitignore` | keeps logs, summaries, baselines, `.bak`/`.partial` files and users' own `hosts.txt` / `subnets.txt` / `inventory.txt` out of git |
