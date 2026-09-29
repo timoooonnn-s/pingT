@@ -28,8 +28,12 @@ Reverse DNS: at most ONE PTR query per host for its whole runtime (cached, throt
 to --dns-rate queries/s, off with --no-dns); "n" then shows FQDNs instead of labels,
 falling back to the IP when a host has no PTR record.
 
+Operator can IGNORE the DOWN hosts of a group (x, group number, same number again) -
+e.g. clients whose users went home before the cut-over. They stay pinged and are watched
+again after --down replies in a row; the summary lists them.
+
 Keys:  q quit   r r reset stats (press twice)   v compact/detail view   n labels/FQDN
-       s sort (detail view)
+       s sort (detail view)   x ignore DOWN hosts of a group (x u = undo)
 """
 
 from __future__ import annotations
@@ -69,8 +73,10 @@ except ModuleNotFoundError as e:
 
 # --------------------------------------------------------------------------- hosts
 
-UNKNOWN, NEVER, OK, WARN, LOSS, DOWN, INVALID = "UNKN", "SILENT", "OK", "WARN", "LOSS", "DOWN", "INVALID"
-SEVERITY = {DOWN: 0, LOSS: 1, WARN: 2, INVALID: 3, UNKNOWN: 4, OK: 5, NEVER: 6}
+UNKNOWN, NEVER, OK, WARN, LOSS, DOWN, INVALID, IGNORED = \
+    "UNKN", "SILENT", "OK", "WARN", "LOSS", "DOWN", "INVALID", "IGNORED"
+SEVERITY = {DOWN: 0, LOSS: 1, WARN: 2, INVALID: 3, UNKNOWN: 4, OK: 5, NEVER: 6, IGNORED: 7}
+IGNORE_CONFIRM_S = 5  # the x dialog closes after this many seconds without a key
 
 
 @dataclass
@@ -93,6 +99,9 @@ class Host:
     fqdn: str | None = None  # from reverse DNS, None = no PTR record (or not looked up yet)
     invalid: str | None = None  # reason if the entry can't be pinged
     addr: str = ""  # IP that is actually pinged: the target itself, or a hostname resolved once at start
+    ignored_at: float | None = None  # set while the operator ignores this host (x key)
+    consec_ok: int = 0  # replies in a row while ignored - enough of them and it's watched again
+    ignore_log: list = field(default_factory=list)  # [ignored at, back at or None] per ignore
 
     @property
     def window_lost(self) -> int:
@@ -109,8 +118,11 @@ class Host:
         self.state = UNKNOWN
         self.outages = 0
         self.longest_outage = 0.0
+        self.consec_ok = 0
         if self.invalid:
             self.state = INVALID
+        elif self.ignored_at is not None:
+            self.state = IGNORED
 
 
 def is_back(h: Host) -> bool:
@@ -376,6 +388,11 @@ class Monitor:
         self._last_error_event = 0.0  # when a PING ERROR was last written to the log
         self.last_round_end = 0.0
         self.notice = ("", 0.0)  # (text, expires) shown in the header
+        self.ignore_step = ""  # x dialog: "" closed, "pick" a group number, "confirm" by pressing it again
+        self.ignore_until = 0.0  # the dialog closes by itself at this time
+        self.ignore_keys: dict[str, str] = {}  # number key -> group, shown next to the group lines
+        self.ignore_preview: list[Host] = []  # the hosts the confirm step will ignore
+        self.last_ignore: tuple[str, list[tuple[Host, dict]]] | None = None  # (group, snapshots) for undo
         self.baseline_path = args.baseline
         self.baseline_seen: set[str] = set()
         self.baseline_dirty = False
@@ -468,6 +485,8 @@ class Monitor:
 
     # -- state machine
     def _evaluate(self, h: Host) -> str:
+        if h.ignored_at is not None:
+            return IGNORED
         if not h.history:
             return UNKNOWN
         if not h.ever_up:  # never answered: offline before we started, not an alarm
@@ -482,6 +501,16 @@ class Monitor:
         return OK
 
     def _record(self, h: Host, rtt: float | None, now: float):
+        if h.ignored_at is not None:  # ignored: nothing is counted, only watch for it coming back
+            h.consec_ok = h.consec_ok + 1 if rtt is not None else 0
+            if h.consec_ok < self.args.down:
+                return
+            h.ignore_log[-1][1] = now
+            self.event(h, f"BACK after being ignored for {fmt_dur(now - h.ignored_at)} - watched again",
+                       "bold green")
+            h.ignored_at, h.consec_ok = None, 0
+            h.ever_up = self.baseline_dirty = True
+            h.state = UNKNOWN  # this reply is recorded below as the first one of a watched host
         if rtt is not None and not h.ever_up:
             h.ever_up = True
             self.baseline_dirty = True
@@ -576,6 +605,106 @@ class Monitor:
                 return f"STALE: no completed round for {fmt_dur(age)}"
         return ""
 
+    # -- ignore: the operator takes the DOWN hosts of a group out of the alarms (clients that went home)
+    def ignore_key(self, key: str | None) -> bool:
+        """The x dialog: x -> group number -> the same number again. True = the key was used here."""
+        now = time.time()
+        with self.lock:
+            if self.ignore_step and now > self.ignore_until:
+                self._ignore_close("ignore cancelled (no key for 5s)")
+            if not key:
+                return False
+            if not self.ignore_step:
+                if key != "x":
+                    return False
+                self._ignore_open(now)
+            elif self.ignore_step == "pick" and key == "u" and self.last_ignore:
+                self._ignore_close("")
+                self._undo_ignore()
+            elif self.ignore_step == "pick" and key in self.ignore_keys:
+                self._ignore_preview(key, now)
+            elif self.ignore_step == "confirm" and key in self.ignore_keys:
+                group, hosts = self.ignore_keys[key], [h for h in self.ignore_preview if h.state == DOWN]
+                self._ignore_close("")
+                if hosts:
+                    self._ignore(group, hosts, now)
+                    self.notice = (f'ignored {len(hosts)} hosts in "{group}" - x u undoes it', now + 5)
+                else:
+                    self.notice = (f'no DOWN hosts left in "{group}" - nothing ignored', now + 3)
+            else:  # any other key cancels, and does nothing else
+                self._ignore_close("ignore cancelled")
+            return True
+
+    def _ignore_open(self, now: float):
+        groups = [g for g, members in self.groups.items() if any(h.state == DOWN for h in members)]
+        undo = (f"u = undo last ignore ({len(self.last_ignore[1])} in {self.last_ignore[0]})"
+                if self.last_ignore else "")
+        if not groups and not undo:
+            self.notice = ("no DOWN hosts to ignore", now + 3)
+            return
+        self.ignore_keys = {str((i + 1) % 10): g for i, g in enumerate(groups[:10])}  # 1..9, 0
+        self.ignore_step, self.ignore_until = "pick", now + IGNORE_CONFIRM_S
+        self.view = "compact"  # the numbers are shown next to the group lines
+        if groups:
+            text = "IGNORE the DOWN hosts of a group: press its number"
+            if len(groups) > 10:
+                text += f" (first 10 of {len(groups)} groups)"
+            text += (", " + undo if undo else "") + ", any other key cancels"
+        else:
+            text = f"no DOWN hosts to ignore - {undo}, any other key cancels"
+        self.notice = (text, self.ignore_until)
+
+    def _ignore_preview(self, key: str, now: float):
+        group = self.ignore_keys[key]
+        hosts = [h for h in self.groups[group] if h.state == DOWN]
+        if not hosts:
+            self._ignore_close(f'no DOWN hosts left in "{group}"')
+            return
+        downs = sorted(now - h.miss_streak_start for h in hosts if h.miss_streak_start)
+        span = ""
+        if downs:
+            span = f" (down {fmt_dur(downs[0])}" + (f" to {fmt_dur(downs[-1])})" if len(downs) > 1 else ")")
+        self.ignore_step, self.ignore_until = "confirm", now + IGNORE_CONFIRM_S
+        self.ignore_keys, self.ignore_preview = {key: group}, hosts
+        self.notice = (f'ignore {len(hosts)} DOWN hosts in "{group}"{span}? press {key} again to confirm',
+                       self.ignore_until)
+
+    def _ignore_close(self, notice: str):
+        self.ignore_step, self.ignore_keys, self.ignore_preview = "", {}, []
+        self.notice = (notice, time.time() + 3) if notice else ("", 0.0)
+
+    def _ignore(self, group: str, hosts: list[Host], now: float):
+        """No alarm, not in "back N/M", no stats - but still pinged, see _record."""
+        snapshots = []
+        for h in hosts:
+            snapshots.append((h, {k: getattr(h, k) for k in UNDO_FIELDS} | {"history": h.history.copy()}))
+            h.reset()  # the outage (user went home) is not migration damage; the event log keeps it
+            h.ever_up = h.from_baseline = False
+            h.ignored_at, h.consec_ok, h.state = now, 0, IGNORED
+            h.ignore_log.append([now, None])
+            self.baseline_seen.discard(h.target)  # a restart must not bring it back as DOWN
+        self.baseline_dirty = True
+        self.last_ignore = (group, snapshots)
+        self.event(None, f"IGNORED {len(hosts)} DOWN hosts in [{group}] (still pinged, watched again after "
+                         f"{self.args.down} replies in a row): " + ", ".join(h.label for h in hosts),
+                   "bold yellow")
+
+    def _undo_ignore(self):
+        group, snapshots = self.last_ignore
+        self.last_ignore = None
+        restored = 0
+        for h, snap in snapshots:
+            if h.ignored_at is None:  # came back in the meantime - it's watched already
+                continue
+            for k, v in snap.items():
+                setattr(h, k, v)
+            h.ignored_at, h.consec_ok = None, 0
+            h.ignore_log.pop()
+            restored += 1
+        self.baseline_dirty = True
+        self.event(None, f"UNDO ignore: {restored} hosts in [{group}] are watched again", "cyan")
+        self.notice = (f'undone: {restored} hosts in "{group}" are watched again', time.time() + 5)
+
     def reset(self):
         with self.lock:
             for h in self.hosts:
@@ -623,6 +752,8 @@ class Monitor:
             (0, f"down {counts[DOWN]}", "bold white on red" if counts[DOWN] else "red"),
             (2, f"silent {counts[NEVER]}", "dim"),
         ]
+        if counts[IGNORED]:
+            segs.append((1, f"ignored {counts[IGNORED]}", "yellow"))
         if counts[INVALID]:
             segs.append((1, f"invalid {counts[INVALID]}", "bold magenta"))
         segs.append((2, f"names:{'FQDN' if self.show_fqdn else 'label'}",
@@ -632,7 +763,7 @@ class Monitor:
                             else f"dns {self.dns_pending} left", "yellow" if self.dns_paused else "dim"))
         segs.append((3, f"{self.backend.name} {fmt_dur(time.time() - self.started)} "
                         f"#{self.rounds} {self.last_round_s:.1f}s", "dim"))
-        segs.append((4, "[q]uit [r]eset [v]iew [n]ames" + (" [s]ort" if self.view == "detail" else ""), "dim"))
+        segs.append((4, "[q]uit [r]eset [v]iew [n]ames [x]ignore" + (" [s]ort" if self.view == "detail" else ""), "dim"))
 
         keep = segs
         while sum(len(t) + 1 for _, t, _ in keep) > width:
@@ -663,7 +794,9 @@ class Monitor:
     # compact view: one glyph per host per group line + problem list
     def _compact(self, width: int, height: int) -> tuple[list, int]:
         name_w = min(22, max(len(g) for g in self.groups))
-        prefix_w = name_w + 1 + 8  # "name 123/456 "
+        marks = {g: k for k, g in self.ignore_keys.items()}  # x dialog: number key per group
+        mark_w = 2 if marks else 0
+        prefix_w = mark_w + name_w + 1 + 8  # "name 123/456 "
         per_line = max(10, ((width - prefix_w + 1) // 11) * 10)  # blocks of 10 glyphs + space
         lines: list[Text] = []
         for gname, members in self.groups.items():
@@ -675,6 +808,9 @@ class Monitor:
             for start in range(0, len(members), per_line):
                 t = Text(no_wrap=True, overflow="crop")
                 if start == 0:
+                    if mark_w:
+                        t.append(marks.get(gname, " "), "bold black on yellow" if gname in marks else "")
+                        t.append(" ")
                     t.append(label.ljust(name_w) + " ", STATE_STYLES[worst][1] or "bold")
                     t.append(f"{up:>3}/{seen:<3} ",
                              "green" if up == seen else STATE_STYLES[worst][0])
@@ -761,7 +897,7 @@ class Monitor:
     def _cell(self, h: Host, name_w: int, hist_w: int, show_pct: bool, with_target: bool) -> Text:
         dot_style, name_style = STATE_STYLES[h.state]
         t = Text(no_wrap=True, overflow="crop")
-        t.append({DOWN: "✖ ", INVALID: "? "}.get(h.state, "● "), dot_style)
+        t.append({DOWN: "✖ ", INVALID: "? ", IGNORED: "- "}.get(h.state, "● "), dot_style)
         name = self._name(h, with_target)
         name = name if len(name) <= name_w else name[: name_w - 1] + "…"
         t.append(name.ljust(name_w), name_style)
@@ -781,6 +917,10 @@ class Monitor:
         return t
 
 
+# what an ignore changes on a host - restored by undo (history is copied separately)
+UNDO_FIELDS = ("sent", "lost", "consec_miss", "miss_streak_start", "state", "outages", "longest_outage",
+               "ever_up", "from_baseline")
+
 # (name width, history width, show loss %) from most to least detailed
 CELL_LAYOUTS = [(18, 20, True), (16, 15, True), (14, 10, True), (12, 8, True), (12, 5, True),
                 (10, 0, True), (8, 0, True), (6, 0, True), (6, 0, False), (4, 0, False)]
@@ -788,6 +928,7 @@ CELL_LAYOUTS = [(18, 20, True), (16, 15, True), (14, 10, True), (12, 8, True), (
 STATE_STYLES = {
     UNKNOWN: ("dim", "dim"),
     NEVER: ("dim", "dim"),
+    IGNORED: ("dim", "dim"),
     INVALID: ("bold magenta", "magenta"),
     OK: ("green", ""),
     WARN: ("yellow", "yellow"),
@@ -798,6 +939,7 @@ STATE_STYLES = {
 GLYPHS = {
     UNKNOWN: ("·", "dim"),
     NEVER: ("○", "dim"),
+    IGNORED: ("-", "dim"),
     INVALID: ("?", "bold magenta"),
     OK: ("●", "green"),
     WARN: ("●", "yellow"),
@@ -860,7 +1002,7 @@ def print_summary(console: Console, mon: Monitor):
     console.print(f"\n[bold]Summary[/bold] - {fmt_dur(time.time() - mon.started)}, {mon.rounds} rounds, "
                   f"[{'green' if up == seen else 'bold red'}]back {up}/{seen}[/] hosts that answered at some point")
     gt = Table(header_style="bold")
-    for col in ("group", "hosts", "back", "not back", "silent", "with loss", "outages", "loss %"):
+    for col in ("group", "hosts", "back", "not back", "silent", "ignored", "with loss", "outages", "loss %"):
         gt.add_column(col, justify="left" if col == "group" else "right")
     for gname, members in mon.groups.items():
         seen_m = [h for h in members if h.ever_up]
@@ -870,7 +1012,8 @@ def print_summary(console: Console, mon: Monitor):
         affected = sum(1 for h in seen_m if h.lost)
         outages = sum(h.outages for h in seen_m)
         gt.add_row(gname, str(len(members)), str(back), str(len(seen_m) - back),
-                   str(sum(1 for h in members if not h.ever_up and not h.invalid)), str(affected), str(outages),
+                   str(sum(1 for h in members if h.state == NEVER)),
+                   str(sum(1 for h in members if h.state == IGNORED)), str(affected), str(outages),
                    f"{100.0 * lost / sent if sent else 0:.2f}",
                    style="bold red" if back < len(seen_m) else ("yellow" if affected else "green"))
     console.print(gt)
@@ -890,7 +1033,19 @@ def print_summary(console: Console, mon: Monitor):
         console.print(f"[bold magenta]INVALID entries, not pinged ({len(invalid)}):[/bold magenta]")
         for h in invalid:
             console.print(f"  [magenta]{h.target:<16}[/magenta] {h.label:<24} [dim]{h.where}[/dim]  {h.invalid}")
-    silent = [h for h in mon.hosts if not h.ever_up and not h.invalid]
+    ignored = [h for h in mon.hosts if h.ignore_log]
+    if ignored:
+        still = sum(1 for h in ignored if h.ignored_at is not None)
+        console.print(f"[bold yellow]IGNORED by operator ({len(ignored)}):[/bold yellow] "
+                      f"{still} still ignored (no reply since), {len(ignored) - still} came back (watched again)")
+        for h in sorted(ignored, key=lambda h: (h.ignored_at is None, h.order)):
+            when = ", ".join(f"ignored {datetime.fromtimestamp(at):%H:%M}"
+                             + (f" back {datetime.fromtimestamp(back):%H:%M}" if back else "")
+                             for at, back in h.ignore_log)
+            status = "still ignored" if h.ignored_at is not None else f"back, {h.state}"
+            name = h.fqdn or h.label
+            console.print(f"  [yellow]{h.target:<16}[/yellow] {name:<30} [dim]{h.group}[/dim]  {status}  [dim]{when}[/dim]")
+    silent = [h for h in mon.hosts if not h.ever_up and not h.invalid and h.ignored_at is None]
     if silent:
         console.print(f"[dim]Silent the whole time ({len(silent)}): "
                       + ", ".join(h.label if h.label == h.target else f"{h.label} ({h.target})" for h in silent)
@@ -1039,6 +1194,9 @@ def main():
             while True:
                 live.update(mon.render(console), refresh=True)
                 key = (kb.get(0.5) or "").lower()
+                if mon.ignore_key(key):  # the x dialog (also closes it after its timeout)
+                    reset_armed_until = 0.0
+                    continue
                 if not key:
                     continue
                 if key == "r" and time.time() < reset_armed_until:

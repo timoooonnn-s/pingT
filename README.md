@@ -70,6 +70,7 @@ Clients 2F      73/76  ●X●●●●●●●● ●●●●●●●●●�
   | `●` red | losing many pings |
   | `X` red | **down** (3 pings in a row lost) |
   | `○` grey | never answered since start — was already off, **ignored** |
+  | `-` grey | ignored by you with `x` (see [clients that went home](#clients-that-went-home)) |
   | `?` purple | typo in the host list, not pinged |
 
 - **Problems:** every host that is not fine, with its recent pings
@@ -85,6 +86,7 @@ Clients 2F      73/76  ●X●●●●●●●● ●●●●●●●●●�
 | `n` | show DNS names instead of your labels (and back) |
 | `s` | in the box view: problems first |
 | `r` `r` | reset the loss counters (press twice) |
+| `x` | ignore the down hosts of a group: `x`, group number, the same number again (`x` `u` = undo) |
 
 ---
 
@@ -99,6 +101,8 @@ Clients 2F      73/76  ●X●●●●●●●● ●●●●●●●●●�
    `./pingT -f hosts.txt --fresh`
    In that time pingT learns which hosts are online. Hosts that never answer are
    greyed out and ignored — they were off before you touched anything.
+4. Clients switched off while you wait? Just before the cut-over, ignore them with `x`
+   (see [clients that went home](#clients-that-went-home)), so `back` is green when you start.
 
 **During the cut-over**
 
@@ -115,6 +119,33 @@ Clients 2F      73/76  ●X●●●●●●●● ●●●●●●●●●�
 
 **When you're done:** press `q`. The summary file lists every host that did **not**
 come back, every outage and all packet loss — your migration record.
+
+### Clients that went home
+
+When a client network is part of the migration, users switch off their PCs while you
+wait for the cut-over. Those hosts turn into red `X` and hide the real damage. Take
+them out, one group at a time:
+
+1. Press **`x`**. Every group with down hosts gets a number next to its line.
+2. Press the group's **number**. The top line asks, e.g.
+   `ignore 23 DOWN hosts in "Clients 2F" (down 4:12 to 1:35:00)? press 2 again to confirm`
+3. Press the **same number again**. Any other key, or 5 seconds without a key, cancels.
+
+Only the hosts that are **down right now** are ignored, and only in that group. They get a
+grey `-`, raise no alarm and don't count in `back`. The top line shows `ignored N`.
+
+- **They are still pinged.** A host that answers again (3 replies in a row, `--down`)
+  is watched again by itself — the event says `BACK after being ignored …`.
+- **Undo:** `x` then `u` undoes the last ignore. Hosts that came back in the meantime
+  are left alone.
+- **During the cut-over** you can do the same when more people go home. Careful: a
+  client broken by the migration looks just like one that was switched off. Check the
+  down times in the question before you confirm.
+- **The summary** lists every ignored host with the time you ignored it and whether it
+  came back — your record says what was ignored, it doesn't disappear.
+- Their outage before the ignore is not counted as loss in the summary; the event
+  log still has it.
+- After a restart (without `--fresh`) ignored hosts start as silent `○`, not as down.
 
 ### If pingT was closed or crashed
 
@@ -263,6 +294,7 @@ pingT looks at the last 20 pings of each host (`-w`).
 | LOSS (red) | 3 or more lost (`--loss`) |
 | DOWN (red `X`) | 3 lost **in a row** (`--down`) |
 | SILENT (grey `○`) | never answered since pingT started — ignored |
+| IGNORED (grey `-`) | you ignored it with `x` — still pinged, watched again after 3 replies in a row |
 | INVALID (purple `?`) | the line in the host list is not a valid IP or name |
 
 - When a down host comes back, its outage is removed from the loss count, so it turns
@@ -280,6 +312,7 @@ pingT looks at the last 20 pings of each host (`-w`).
 | `back N/M` | reachable now / hosts that answered at some point |
 | `ok warn loss down` | number of hosts in each state |
 | `silent` | hosts that never answered |
+| `ignored` | hosts you ignored with `x` (only shown if there are any) |
 | `invalid` | host list lines that can't be pinged (only shown if there are any) |
 | `names:label` / `names:FQDN` | which names are shown (`n` switches) |
 | `dns N left` | DNS name lookups still running |
