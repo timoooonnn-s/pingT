@@ -1,0 +1,12 @@
+# Subnets for scan.py - one per line, '#' comments.
+# Optional group name after the CIDR (whitespace or "=" separated); it becomes the
+# [section] in the generated pingT inventory. Without a name, the CIDR is used.
+
+10.0.10.0/24   Servers VLAN10
+10.0.20.0/24   Clients EG
+10.0.21.0/24   Clients 1.OG
+10.0.22.0/24   Clients 2.OG
+10.0.30.0/24   Printers
+10.0.40.0/24   WLAN APs
+10.0.50.0/24   VoIP Phones
+10.0.99.0/24   Management

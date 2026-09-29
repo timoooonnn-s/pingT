@@ -1,0 +1,23 @@
+# Timmy Pinger (pingT) hosts file - one host per line, '#' starts a comment
+# Formats (mix freely):
+#   [Group name]                    section header: group for the lines below ([] ends it)
+#   <ip-or-name>  [label]           whitespace separated
+#   <ip-or-name>,<label>,<group>    CSV (group column overrides the section)
+# Hosts with no group are grouped by /24 automatically.
+
+[Servers VLAN10]
+10.0.10.1    gw-vlan10
+10.0.10.11   esx-01
+10.0.10.12   esx-02
+
+[Clients 2F]
+10.0.20.101  pc-2f-101
+10.0.20.102  pc-2f-102
+
+# CSV style, e.g. pasted from an IPAM / spreadsheet export
+10.0.30.5,printer-3f,Printers
+10.0.40.21,ap-lobby,APs
+
+# "[]" ends the section -> no group -> auto-grouped as "10.0.50.0/24"
+[]
+10.0.50.7
