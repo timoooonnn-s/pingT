@@ -18,6 +18,7 @@ import io
 import json
 import math
 import os
+import queue
 import re
 import select
 import shutil
@@ -277,21 +278,23 @@ class FpingBackend:
 
 # --------------------------------------------------------------------------- reverse dns
 
-DNS_RATE = 10  # reverse DNS queries per second at most
+DNS_WORKERS = 32  # reverse DNS queries in flight at once
+DNS_RETRY_S = 2  # between two rounds of retries
 DNS_PAUSE_S = 60  # while the DNS server doesn't answer: one query per this many seconds
 DNS_MAX_TRIES = 5  # queries without a usable answer before a host is given up
 
 
 def ptr_lookup(ip: str) -> tuple[bool, str | None]:
     """One reverse lookup -> (answered, name). "No PTR record" is an answer: (True, None).
-    (False, None) = no usable answer (timeout, SERVFAIL) - may work later."""
+    (False, None) = no usable answer (timeout) - may work later.
+
+    getnameinfo, not gethostbyaddr: on macOS Python runs gethostbyaddr behind a global
+    lock, so parallel lookups would still go out one at a time."""
     try:
-        return True, socket.gethostbyaddr(ip)[0].rstrip(".") or None
-    except socket.herror as e:
-        # h_errno: 1 HOST_NOT_FOUND, 4 NO_DATA = the DNS server answered "no PTR record"
-        # 2 TRY_AGAIN (timeout), 3 NO_RECOVERY (SERVFAIL) = no usable answer
-        return e.errno in (1, 4), None
+        return True, socket.getnameinfo((ip, 0), socket.NI_NAMEREQD)[0].rstrip(".") or None
     except socket.gaierror as e:
+        # EAI_NONAME / EAI_NODATA = the DNS server answered "no PTR record"
+        # EAI_AGAIN (timeout), EAI_FAIL (SERVFAIL) = no usable answer
         return e.errno in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)), None
     except UnicodeError:  # a PTR record that isn't a valid name - an answer, just a useless one
         return True, None
@@ -302,34 +305,73 @@ def ptr_lookup(ip: str) -> tuple[bool, str | None]:
 def resolve_names(mon: "Monitor"):
     """Reverse DNS for every host, until it gets an answer - then never again.
 
-    A host without a usable answer goes to the back of the queue; after DNS_MAX_TRIES it is
-    given up (shown by its IP). When 3 different hosts in a row get no answer, the DNS server
-    counts as unreachable (e.g. behind the migrated switch): then only one query per
-    DNS_PAUSE_S goes out until it answers again, and those probes use up no tries.
+    All open hosts are asked at once (DNS_WORKERS in flight), names show up as they come
+    in. Hosts without a usable answer are asked again in the next round; after
+    DNS_MAX_TRIES they are given up (shown by their IP). When a whole round gets no answer
+    and a host that did answer before (the canary) doesn't either, the DNS server counts
+    as unreachable (e.g. behind the migrated switch): then only one query per DNS_PAUSE_S
+    goes out until it answers again, and those rounds use up no tries.
     """
-    todo: deque[tuple[Host, int]] = deque()
+    todo: list[Host] = []
     with mon.lock:
         for h in mon.hosts:
             if not h.invalid and is_ip(h.target):
-                todo.append((h, 0))
+                todo.append(h)
             elif not h.invalid:
                 h.fqdn = h.target  # already a name: no query needed
         mon.dns_pending = len(todo)
-    failing: set[int] = set()  # hosts (by order) without an answer since the last answer
+    if not todo:
+        return
+    jobs: queue.SimpleQueue[Host] = queue.SimpleQueue()
+    results: queue.SimpleQueue[tuple[Host, bool, str | None]] = queue.SimpleQueue()
+
+    def worker():
+        while True:
+            h = jobs.get()
+            results.put((h, *ptr_lookup(h.addr)))
+
+    for _ in range(min(DNS_WORKERS, len(todo))):  # daemon threads: a hanging lookup never blocks quitting
+        threading.Thread(target=worker, daemon=True).start()
+
+    t_start = time.time()
+    tries: Counter[int] = Counter()  # by host order
+    canary: str | None = None  # an IP whose lookup was answered: tells "server down" from "this host fails"
+    named = given_up = 0
     while todo and not mon.stop.is_set():
-        t0 = time.time()
-        h, tries = todo.popleft()
-        answered, name = ptr_lookup(h.addr)
-        tries += not mon.dns_paused
-        failing = set() if answered else failing | {h.order}
-        with mon.lock:
-            if answered or tries >= DNS_MAX_TRIES:
+        if mon.dns_paused:  # one probe; the full round only once the server answers again
+            if not ptr_lookup(canary or todo[0].addr)[0]:
+                mon.stop.wait(DNS_PAUSE_S)
+                continue
+            with mon.lock:
+                mon.dns_paused = False
+        for h in todo:
+            jobs.put(h)
+        failed: list[Host] = []
+        for _ in todo:
+            h, answered, name = results.get()
+            if not answered:
+                failed.append(h)
+                continue
+            canary = canary or h.addr
+            named += name is not None
+            with mon.lock:
                 h.fqdn = name
-            else:
-                todo.append((h, tries))  # try the others first, this one again later
+                mon.dns_pending -= 1
+        server_down = len(failed) == len(todo) and (canary is None or not ptr_lookup(canary)[0])
+        if not server_down:
+            for h in failed:
+                tries[h.order] += 1
+            given_up += sum(tries[h.order] >= DNS_MAX_TRIES for h in failed)
+            failed = [h for h in failed if tries[h.order] < DNS_MAX_TRIES]  # given up: stays None = IP
+        todo = failed
+        with mon.lock:
             mon.dns_pending = len(todo)
-            mon.dns_paused = len(failing) >= 3
-        mon.stop.wait(DNS_PAUSE_S if mon.dns_paused else max(0.0, 1 / DNS_RATE - (time.time() - t0)))
+            mon.dns_paused = server_down
+            if not todo:
+                mon.event(None, f"dns done in {fmt_dur(time.time() - t_start)}: {named} names, "
+                                f"{given_up} without an answer", "dim")
+        if todo:
+            mon.stop.wait(DNS_PAUSE_S if server_down else DNS_RETRY_S)
 
 
 def is_ip(target: str) -> bool:

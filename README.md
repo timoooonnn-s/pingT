@@ -381,12 +381,14 @@ The summary is also saved on Ctrl-C, `kill`, or when the SSH session drops.
 is no DNS name.
 
 - **One answer per host, for the whole run.** The answer is kept; nothing is asked
-  again. Lookups are spread out (max 10 per second): 255 hosts take ~25 s.
-- A host that gets no answer (timeout) is asked again later, up to 5 times; after
-  that pingT gives up on it and shows its IP.
-- If 3 different hosts in a row get no answer, the DNS server itself counts as down
-  (e.g. because it's behind the switch you're migrating). pingT then sends only
-  **one lookup per minute** until it answers again — those don't count toward the 5.
+  again. All hosts are looked up at once (32 queries in flight), so names show up
+  within seconds; the log gets a `dns done` line with how long it took.
+- A host that gets no answer (timeout) is asked again a few seconds later, up to 5
+  times; after that pingT gives up on it and shows its IP.
+- If no host at all gets an answer — not even one that answered before — the DNS
+  server itself counts as down (e.g. because it's behind the switch you're migrating).
+  pingT then sends only **one lookup per minute** until it answers again — those don't
+  count toward the 5.
   The top line shows `dns no answer … (probing 1/min)`.
 - Hosts written as DNS names in the host list are not looked up again.
 - `--no-dns` turns it off.
