@@ -58,20 +58,15 @@ class Subnet:
         self.targets: list[str] = []  # filled by expand(), after the size check
         self.alive: dict[str, int] = {}  # ip -> pass that found it
 
-    def expand(self, taken: set[str]) -> int:
-        """Fill self.targets; addresses already owned by an earlier subnet are skipped.
-        Returns how many were skipped (overlap)."""
-        if self.net.prefixlen >= self.net.max_prefixlen - 1:
-            addresses = iter(self.net)  # /31, /32: every address
-        else:
-            addresses = self.net.hosts()  # skips network + broadcast
+    def expand(self, owner: dict[str, Subnet]) -> int:
+        """Fill self.targets and owner (ip -> its subnet); addresses already owned by an
+        earlier subnet are skipped. Returns how many were skipped (overlap)."""
         overlap = 0
-        for ip in addresses:
-            ip = str(ip)
-            if ip in taken:
+        for ip in map(str, self.net.hosts()):  # skips network + broadcast (/31, /32: every address)
+            if ip in owner:
                 overlap += 1
                 continue
-            taken.add(ip)
+            owner[ip] = self
             self.targets.append(ip)
         return overlap
 
@@ -79,30 +74,27 @@ class Subnet:
         return len(self.targets)
 
 
+def parse_subnet_spec(spec: str) -> tuple[str, str | None]:
+    """ "10.0.0.0/24=Group name", "10.0.0.0/24  Group name" or "10.0.0.0/24" -> (cidr, group or None)"""
+    cidr, _, group = spec.partition("=")
+    if not group.strip():  # whitespace separated
+        cidr, group = (cidr.split(None, 1) + ["", ""])[:2]
+    return cidr.strip(), group.strip() or None
+
+
 def parse_subnets_file(path: str) -> list[tuple[str, str | None]]:
     out = []
     with open(path, encoding="utf-8-sig") as fh:
         for raw in fh:
             line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            line = INLINE_COMMENT.sub("", line).strip()
-            cidr, _, group = (c.strip() for c in line.partition("="))
-            if not group:  # "10.0.0.0/24  Group name" (whitespace separated)
-                parts = cidr.split(None, 1)
-                cidr, group = parts[0], (parts[1].strip() if len(parts) > 1 else "")
-            out.append((cidr, group or None))
+            if line and not line.startswith("#"):
+                out.append(parse_subnet_spec(INLINE_COMMENT.sub("", line)))
     return out
 
 
-def sweep(subnets: list[Subnet], backend: FpingBackend, console: Console) -> None:
+def sweep(owner: dict[str, Subnet], backend: FpingBackend, console: Console) -> None:
     """Probes every address of all subnets, then re-probes only the silent ones."""
-    owner = {ip: sub for sub in subnets for ip in sub.targets}
-    failed_in_row = 0
-
-    def found() -> int:
-        return sum(len(s.alive) for s in subnets)
-
+    failed_in_row = found = 0
     with Progress(TextColumn("[bold]{task.fields[name]}"), BarColumn(),
                   TextColumn("{task.completed}/{task.total} addr"),
                   TextColumn("[green]{task.fields[found]} found"),
@@ -114,7 +106,7 @@ def sweep(subnets: list[Subnet], backend: FpingBackend, console: Console) -> Non
             # spread each pass over all fping processes, even when it's only a few addresses
             backend.chunk = max(1, min(CHUNK_MAX, math.ceil(len(todo) / WORKERS)))
             step = backend.chunk * WORKERS
-            task = progress.add_task("", name=f"pass {p}/{PASSES}", total=len(todo), found=found())
+            task = progress.add_task("", name=f"pass {p}/{PASSES}", total=len(todo), found=found)
             for i in range(0, len(todo), step):
                 batch = todo[i:i + step]
                 results, errors = backend.round(batch)
@@ -129,25 +121,26 @@ def sweep(subnets: list[Subnet], backend: FpingBackend, console: Console) -> Non
                 for ip, rtt in results.items():
                     if rtt is not None:
                         owner[ip].alive[ip] = p
-                progress.update(task, advance=len(batch), found=found())
+                        found += 1
+                progress.update(task, advance=len(batch), found=found)
 
 
 def ip_sort_key(target: str):
     return (0, ipaddress.ip_address(target)) if is_ip(target) else (1, target)
 
 
-def build_inventory(subnets: list[Subnet], old: dict[str, tuple[str, str | None]],
+def build_inventory(subnets: list[Subnet], owner: dict[str, Subnet], old: dict[str, tuple[str, str | None]],
                     keep_missing: bool, merge_name: str) -> tuple[str, list[str], list[str]]:
     """pingT inventory text: one [group] section per group, one IP per line.
 
     Hosts from the --merge inventory are never lost silently:
     - inside a scanned subnet but no reply: kept, marked "# no reply in scan <date>"
       (left out with keep_missing=False, i.e. --drop-missing)
-    - outside the scanned subnets (or hostnames): not scanned, so kept unchanged in their old group
+    - not scanned (outside the subnets, a network/broadcast address, or a hostname): kept unchanged
+      in their old group
     Returns (text, hosts in the scanned subnets that didn't answer, hosts kept because not scanned).
     """
-    today = f"{datetime.now():%Y-%m-%d}"
-    alive_all = {ip for s in subnets for ip in s.alive}
+    now = datetime.now()
     no_reply: list[str] = []
     not_scanned: list[str] = []
     sections: dict[str, list[tuple[str, bool]]] = {}  # group -> (target, no reply)
@@ -156,9 +149,9 @@ def build_inventory(subnets: list[Subnet], old: dict[str, tuple[str, str | None]
         sections.setdefault(sub.group, []).extend((ip, False) for ip in sub.alive)
         nets.setdefault(sub.group, []).append(sub)
     for target, (_, old_group) in old.items():
-        if target in alive_all:
+        sub = owner.get(target)
+        if sub and target in sub.alive:
             continue
-        sub = next((s for s in subnets if is_ip(target) and ipaddress.ip_address(target) in s.net), None)
         if sub:  # scanned, didn't answer
             no_reply.append(target)
             if keep_missing:
@@ -169,8 +162,8 @@ def build_inventory(subnets: list[Subnet], old: dict[str, tuple[str, str | None]
 
     summary = [f"{len(no_reply)} kept from {merge_name} without reply" if no_reply and keep_missing else "",
                f"{len(not_scanned)} kept from {merge_name} (not scanned)" if not_scanned else ""]
-    lines = [f"# generated by scan.py on {datetime.now():%Y-%m-%d %H:%M}, ICMP sweep, {PASSES} passes",
-             f"# {len(alive_all)} hosts answered out of {sum(len(s) for s in subnets)} scanned addresses"
+    lines = [f"# generated by scan.py on {now:%Y-%m-%d %H:%M}, ICMP sweep, {PASSES} passes",
+             f"# {sum(len(s.alive) for s in subnets)} hosts answered out of {len(owner)} scanned addresses"
              + "".join(f", {x}" for x in summary if x), ""]
     for group, entries in sections.items():
         if group in nets:
@@ -182,7 +175,7 @@ def build_inventory(subnets: list[Subnet], old: dict[str, tuple[str, str | None]
             label = old.get(target, ("", None))[0]  # keep the label from --merge, if any
             line = f"{target:<16} {label}".rstrip()
             if silent:
-                line += f"  # no reply in scan {today}"
+                line += f"  # no reply in scan {now:%Y-%m-%d}"
             lines.append(line)
         lines.append("")
     return "\n".join(lines), no_reply, not_scanned
@@ -232,9 +225,7 @@ def main():
             entries += parse_subnets_file(path)
         except OSError as e:
             ap.error(f"cannot read subnets file: {e}")
-    for spec in args.subnets:
-        cidr, _, group = spec.partition("=")
-        entries.append((cidr.strip(), group.strip() or None))
+    entries += [parse_subnet_spec(spec) for spec in args.subnets]
     if not entries:
         ap.error("no subnets given (e.g. 10.0.10.0/24, or -f subnets.txt)")
 
@@ -257,9 +248,9 @@ def main():
     if size > MAX_TOTAL and not args.force:
         ap.error(f"{size:,} addresses in total - more than {MAX_TOTAL:,}. Scan fewer subnets per run, "
                  f"or use --force.")
-    taken: set[str] = set()
+    owner: dict[str, Subnet] = {}  # ip -> the subnet it is scanned for
     for sub in subnets:
-        overlap = sub.expand(taken)
+        overlap = sub.expand(owner)
         if overlap:
             console.print(f"[yellow]note:[/yellow] {sub.net} overlaps an earlier subnet - {overlap} addresses "
                           f"stay in the earlier group")
@@ -272,7 +263,7 @@ def main():
         except OSError as e:
             ap.error(f"cannot read --merge inventory: {e}")
 
-    total = sum(len(s) for s in subnets)
+    total = len(owner)
     spacing = max(1, round(1000 * WORKERS / args.rate))  # ms between probes per fping process
     backend = FpingBackend(args.timeout, spacing, CHUNK_MAX, workers=WORKERS)
     batches = math.ceil(total / (CHUNK_MAX * WORKERS)) if total else 0
@@ -283,13 +274,13 @@ def main():
     t0 = time.time()
     interrupted = None
     try:
-        sweep(subnets, backend, console)
+        sweep(owner, backend, console)
     except KeyboardInterrupt:
         interrupted = "interrupted"
     except ScanAborted as e:
         interrupted = str(e)
 
-    text, no_reply, not_scanned = build_inventory(subnets, old, keep_missing=not args.drop_missing,
+    text, no_reply, not_scanned = build_inventory(subnets, owner, old, keep_missing=not args.drop_missing,
                                                   merge_name=os.path.basename(args.merge) if args.merge else "")
     out = args.out
     if interrupted:  # incomplete: never replace a good inventory with it

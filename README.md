@@ -85,7 +85,7 @@ Clients 2F      73/76  ●X●●●●●●●● ●●●●●●●●●�
 | `v` | switch view: groups ↔ every host as its own box |
 | `n` | show DNS names instead of your labels (and back) |
 | `r` `r` | reset the loss counters (press twice) |
-| `x` | ignore the down hosts of a group: `x`, group number, the same number again (`x` `u` = undo) |
+| `x` | ignore the down hosts of a group (see [clients that went home](#clients-that-went-home)) |
 | `Esc` | cancel a question (`r`, `x`) |
 
 While `r` or `x` waits for its answer, other keys (arrow keys too) do nothing — only the answer,
@@ -158,8 +158,9 @@ Start it again **without** `--fresh`:
 ./pingT -f hosts.txt
 ```
 
-pingT remembers which hosts were online before, so hosts that are still down show up
-as down (instead of being ignored as "never answered").
+pingT remembers (in its baseline file) which hosts were online before, so hosts that
+are still down show up as down instead of being ignored as "never answered". It warns
+when that file is older than 24 hours — then you probably wanted `--fresh`.
 
 ---
 
@@ -214,7 +215,6 @@ Everything in detail. You don't need this to use the tools.
 - [The screen in detail](#the-screen-in-detail)
 - [Host list format](#host-list-format)
 - [Files pingT writes](#files-pingt-writes)
-- [Remembering hosts across restarts](#remembering-hosts-across-restarts)
 - [DNS names](#dns-names)
 - [How often hosts are pinged](#how-often-hosts-are-pinged)
 - [Troubleshooting](#troubleshooting)
@@ -259,28 +259,25 @@ The thresholds must fit together: `1 <= --warn <= --loss <= -w`.
 | `--rate N` | `400` | max pings per second in total |
 | `--force` | | allow subnets bigger than `/16` or more than 262,144 addresses in one scan |
 
-- **Rounds:** every address is pinged in round 1; rounds 2 and 3 only re-try the addresses
-  that didn't answer. The network and broadcast address of a subnet are skipped.
+- **Rounds:** rounds 2 and 3 only re-try the addresses that didn't answer. The network and
+  broadcast address of a subnet are skipped.
 - **Speed:** all subnets are scanned together. Worst case (nothing answers): one `/24`
   ~4 s, three `/24` ~8 s. For big scans `--rate` sets the pace: 2,500 addresses ~8 s per round.
 - **Rate:** scanning unused addresses makes the router look up (ARP) every one of them —
   that is what can stress a network, not the pings. Raise `--rate` only if your routers cope.
-- **Size limit:** a subnet above `/16` is refused (a typo like `/8` would mean 16 million
-  addresses). `--force` overrides it.
 - **Overlapping subnets:** each address is scanned once and belongs to the first subnet
   that contains it. Subnets with the same group name end up in one `[group]`.
 - **Ctrl-C** (or repeated fping errors) stops the scan and writes what was found to
   `FILE.partial` — your host list is **not** changed.
-- **`--merge` in detail:** devices that answered get the name from the old list. Devices
-  in the scanned subnets that didn't answer are kept and marked `# no reply in scan <date>`
-  (`--drop-missing` leaves them out). Devices outside the scanned subnets, and DNS names,
-  are kept unchanged in their old group.
+- **`--merge`:** entries that weren't scanned — outside the subnets, a network/broadcast
+  address, or a DNS name — are kept unchanged in their old group.
 - Subnet list: `CIDR  Group name` or `CIDR=Group name`, `#` starts a comment. Without a
   name, the subnet itself is the group name. Example: [subnets.example.txt](subnets.example.txt)
 
 ## States and alarms
 
-pingT looks at the last 20 pings of each host (`-w`).
+pingT looks at the last 20 pings of each host (`-w`). The exact limits behind the colors
+(grey and purple: see [what you see](#what-you-see)):
 
 | State | When (defaults) |
 |---|---|
@@ -288,9 +285,6 @@ pingT looks at the last 20 pings of each host (`-w`).
 | WARN (yellow) | 2 lost (`--warn`) |
 | LOSS (red) | 3 or more lost (`--loss`) |
 | DOWN (red `X`) | 3 lost **in a row** (`--down`) |
-| SILENT (grey `○`) | never answered since pingT started — ignored |
-| IGNORED (grey `-`) | you ignored it with `x` — still pinged, watched again after 3 replies in a row |
-| INVALID (purple `?`) | the line in the host list is not a valid IP or name |
 
 - When a down host comes back, its outage is removed from the loss count, so it turns
   green right away. The outage is still in the event log and the summary.
@@ -349,7 +343,7 @@ switch01.corp.local   sw01        # a DNS name also works
 - The same address twice: the first line counts, the address is pinged once.
 - Lines with typos or unknown names are shown as invalid and skipped — pingT still starts.
 - DNS names are looked up **once** at start; pingT then pings the IP. If a name gets a
-  new IP during the run, restart pingT.
+  new IP during the run, restart pingT. A name without an answer within 5 s is invalid.
 - Example: [hosts.example.txt](hosts.example.txt). To just try pingT out, list a few
   IPs directly: `./pingT 1.1.1.1 8.8.8.8`
 
@@ -361,19 +355,11 @@ Next to the event log — with the default `--log`, in the folder you start ping
 |---|---|
 | `pingT-events.log` | every event with date and time — added to on every run |
 | `pingT-events-summary-<date>-<time>.txt` | the summary, saved every time pingT stops (named with the time it stopped) |
-| `pingT-events-baseline.json` | which hosts were online (for restarts) |
+| `pingT-events-baseline.json` | which hosts were online (for [restarts](#if-pingt-was-closed-or-crashed)) |
 
 With `--log other.log` the files are named `other…` instead of `pingT-events…`.
 
 The summary is also saved on Ctrl-C, `kill`, or when the SSH session drops.
-
-## Remembering hosts across restarts
-
-- A host that answers once is saved in the baseline file.
-- When pingT starts, it reads that file: hosts from it count as "were online", so if
-  they don't answer they show up as **down** instead of silent.
-- `--fresh` ignores the old file and starts over — use it for every new migration.
-  pingT also warns when the file is older than 24 hours.
 
 ## DNS names
 
@@ -416,12 +402,10 @@ is no DNS name.
 | Many hosts grey (silent) | They haven't answered since pingT started: switched off, or blocking ping. Start pingT earlier. |
 | After a restart everything is grey | You started with `--fresh`, or from another folder, or with another `--log` (the baseline file is next to the event log). |
 | `invalid` hosts at the top | Typos or unknown names in the host list; shown with file and line number. |
-| `dns no answer … (probing 1/min)` | The DNS server doesn't answer. Names appear once it does. |
 | `note: … a round can take ~Xs` at start | Harmless: with many hosts down, rounds take a bit longer than 1 s. |
 | `… the Python package 'rich' is missing …` | You started it without your Python environment. Activate it (the one with `rich` installed) and start again. |
 | `Permission denied` when starting `./pingT` | The file lost its "executable" flag while copying: `chmod +x pingT scan.py`. |
-| Scanner: `… more than a /16` | Protection against typos. Split the range or add `--force`. |
-| Scanner: `FILE.partial` appeared | A scan was interrupted; your host list was not changed. Run the scan again. |
+| Scanner: `… more than a /16` | Protection against typos (`/8` would be 16 million addresses). Split the range or add `--force`. |
 
 ## For the maintainer
 

@@ -172,11 +172,30 @@ HOSTNAME_RE = re.compile(r"^(?=.{1,253}\.?$)[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Z
                          r"(\.[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)*\.?$")
 
 
+RESOLVE_TIMEOUT_S = 5  # per hostname at start, counted from when its own lookup begins
+
+
+def start_workers(func, n: int) -> tuple[queue.SimpleQueue, queue.SimpleQueue]:
+    """n threads: an item put into jobs comes out of results as (item, func(item)); a None
+    ends one thread. Daemon threads, so a hanging DNS lookup never blocks quitting."""
+    jobs: queue.SimpleQueue = queue.SimpleQueue()
+    results: queue.SimpleQueue = queue.SimpleQueue()
+
+    def worker():
+        while (item := jobs.get()) is not None:
+            results.put((item, func(item)))
+
+    for _ in range(n):
+        threading.Thread(target=worker, daemon=True).start()
+    return jobs, results
+
+
 def validate_targets(hosts: list[Host]):
     """Sets h.addr (the IP to ping), or h.invalid (and state INVALID) for entries that can't be pinged.
 
     Hostnames are resolved exactly once, here. fping then only gets IPs, so it doesn't
-    query DNS again on every round.
+    query DNS again on every round. Each name gets RESOLVE_TIMEOUT_S from when its own
+    lookup starts, so a long list on a slow DNS server doesn't time out names still in line.
     """
     to_resolve = []
     for h in hosts:
@@ -190,22 +209,35 @@ def validate_targets(hosts: list[Host]):
         else:
             to_resolve.append(h)
     if to_resolve:
-        pool = ThreadPoolExecutor(max_workers=min(32, len(to_resolve)))
-        futures = [(h, pool.submit(socket.getaddrinfo, h.target, None)) for h in to_resolve]
-        deadline = time.time() + 5.0  # for all names together
-        for h, fut in futures:
+        started: dict[int, float] = {}  # host order -> when its lookup began
+
+        def lookup(h: Host) -> list:
+            started[h.order] = time.time()
             try:
-                infos = fut.result(timeout=max(0.0, deadline - time.time()))
-            except Exception:
-                h.invalid = "hostname does not resolve"
-                continue
-            # prefer IPv4 (what these networks mostly use), otherwise the first address
-            addrs = [i[4][0] for i in infos if i[0] == socket.AF_INET] or [i[4][0] for i in infos]
-            if addrs:
-                h.addr = addrs[0]
-            else:
-                h.invalid = "hostname does not resolve"
-        pool.shutdown(wait=False, cancel_futures=True)
+                return socket.getaddrinfo(h.target, None)
+            except OSError:
+                return []
+
+        n = min(DNS_WORKERS, len(to_resolve))
+        jobs, results = start_workers(lookup, n)
+        for h in [*to_resolve, *[None] * n]:  # the Nones end the workers once every name is done
+            jobs.put(h)
+        pending = {h.order: h for h in to_resolve}
+        while pending:
+            try:
+                h, infos = results.get(timeout=0.2)
+                if pending.pop(h.order, None):  # else: answered after its timeout
+                    # prefer IPv4 (what these networks mostly use), otherwise the first address
+                    addrs = [i[4][0] for i in infos if i[0] == socket.AF_INET] or [i[4][0] for i in infos]
+                    if addrs:
+                        h.addr = addrs[0]
+                    else:
+                        h.invalid = "hostname does not resolve"
+            except queue.Empty:
+                pass
+            now = time.time()
+            for order in [o for o in pending if now - started.get(o, now) > RESOLVE_TIMEOUT_S]:
+                pending.pop(order).invalid = f"no DNS answer within {RESOLVE_TIMEOUT_S}s"
     for h in hosts:
         if h.invalid:
             h.state = INVALID
@@ -253,8 +285,8 @@ class FpingBackend:
                 parsed += 1
                 try:
                     results[host] = float(value.strip())
-                except ValueError:
-                    results[host] = None
+                except ValueError:  # "-" = no reply: stays None
+                    pass
         # exit 0 = all alive, 1 = some unreachable, 2 = some names unresolvable; 3/4 = fping error
         if proc.returncode >= 3 or parsed == 0:
             msg = [l for l in proc.stderr.strip().splitlines() if " : " not in l]
@@ -322,21 +354,12 @@ def resolve_names(mon: "Monitor"):
         mon.dns_pending = len(todo)
     if not todo:
         return
-    jobs: queue.SimpleQueue[Host] = queue.SimpleQueue()
-    results: queue.SimpleQueue[tuple[Host, bool, str | None]] = queue.SimpleQueue()
-
-    def worker():
-        while True:
-            h = jobs.get()
-            results.put((h, *ptr_lookup(h.addr)))
-
-    for _ in range(min(DNS_WORKERS, len(todo))):  # daemon threads: a hanging lookup never blocks quitting
-        threading.Thread(target=worker, daemon=True).start()
-
+    n = min(DNS_WORKERS, len(todo))
+    jobs, results = start_workers(lambda h: ptr_lookup(h.addr), n)
     t_start = time.time()
     tries: Counter[int] = Counter()  # by host order
     canary: str | None = None  # an IP whose lookup was answered: tells "server down" from "this host fails"
-    named = given_up = 0
+    named = no_name = given_up = 0
     while todo and not mon.stop.is_set():
         if mon.dns_paused:  # one probe; the full round only once the server answers again
             if not ptr_lookup(canary or todo[0].addr)[0]:
@@ -348,12 +371,13 @@ def resolve_names(mon: "Monitor"):
             jobs.put(h)
         failed: list[Host] = []
         for _ in todo:
-            h, answered, name = results.get()
+            h, (answered, name) = results.get()
             if not answered:
                 failed.append(h)
                 continue
             canary = canary or h.addr
             named += name is not None
+            no_name += name is None
             with mon.lock:
                 h.fqdn = name
                 mon.dns_pending -= 1
@@ -369,9 +393,11 @@ def resolve_names(mon: "Monitor"):
             mon.dns_paused = server_down
             if not todo:
                 mon.event(None, f"dns done in {fmt_dur(time.time() - t_start)}: {named} names, "
-                                f"{given_up} without an answer", "dim")
+                                f"{no_name} without a DNS name, {given_up} gave no answer", "dim")
         if todo:
             mon.stop.wait(DNS_PAUSE_S if server_down else DNS_RETRY_S)
+    for _ in range(n):  # done (or quitting): end the workers
+        jobs.put(None)
 
 
 def is_ip(target: str) -> bool:
