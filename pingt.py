@@ -4,10 +4,10 @@ Timmy Pinger (pingT) - watch hundreds of hosts at once during a switch migration
 
 Pings every host once per round with fping and shows all of them on one screen; only
 several lost pings raise an alarm. Start it with the ./pingT launcher (scan.py imports
-this module too). How it works and all options: README.md.
+this module too). IPv4 only. How it works and all options: README.md.
 
-Keys:  q quit   r r reset stats   v view   n labels/DNS names   x ignore DOWN hosts of a group
-       Esc cancels a question (r r, x)
+Keys:  q quit   r r reset stats   v view   n names (label / DNS / IP)   x ignore DOWN hosts of a group
+       g characters (unicode / safe / ascii, for PuTTY)   Esc cancels a question (r r, x)
 """
 
 from __future__ import annotations
@@ -36,8 +36,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 try:
+    from rich import box
     from rich.console import Console, Group
     from rich.live import Live
+    from rich.markup import escape
     from rich.table import Table
     from rich.text import Text
 except ModuleNotFoundError as e:
@@ -54,6 +56,12 @@ UNKNOWN, NEVER, OK, WARN, LOSS, DOWN, INVALID, IGNORED = \
     "UNKN", "SILENT", "OK", "WARN", "LOSS", "DOWN", "INVALID", "IGNORED"
 SEVERITY = {DOWN: 0, LOSS: 1, WARN: 2, INVALID: 3, UNKNOWN: 4, OK: 5, NEVER: 6, IGNORED: 7}
 ASK_TIMEOUT_S = 5  # a question (r r, the x dialog) closes after this many seconds without an answer
+ALL_DOWN_MIN = 5  # "ALL DOWN" warning only with at least this many watched hosts (not for a 2-host test)
+RESOLVE_TIMEOUT_S = 5  # per hostname at start, counted from when its own lookup begins
+DNS_WORKERS = 32  # DNS queries in flight at once
+DNS_RETRY_S = 2  # between two rounds of reverse-DNS retries
+DNS_PAUSE_S = 60  # while the DNS server doesn't answer: one query per this many seconds
+DNS_MAX_TRIES = 5  # queries without a usable answer before a host is given up
 
 
 @dataclass
@@ -129,13 +137,27 @@ def all_back(up: int, seen: int) -> bool:
     return up == seen and seen > 0
 
 
-def auto_group(target: str) -> str:
+def is_ip(target: str) -> bool:
+    """IPv4 only - see DECISIONS.md."""
     try:
-        ip = ipaddress.ip_address(target)
+        ipaddress.IPv4Address(target)
+        return True
     except ValueError:
+        return False
+
+
+def is_ipv6(target: str) -> bool:
+    try:
+        return ipaddress.ip_address(target).version == 6
+    except ValueError:
+        return False
+
+
+def auto_group(target: str) -> str:
+    """Group of an entry without one: its /24, or "other" for a hostname."""
+    if not is_ip(target):
         return "other"
-    prefix = 24 if ip.version == 4 else 64
-    return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+    return str(ipaddress.IPv4Network(f"{target}/24", strict=False))
 
 
 INLINE_COMMENT = re.compile(r"\s+#(\s.*)?$")  # " # note" ends a line, "Raum #12" doesn't
@@ -172,9 +194,6 @@ HOSTNAME_RE = re.compile(r"^(?=.{1,253}\.?$)[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Z
                          r"(\.[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)*\.?$")
 
 
-RESOLVE_TIMEOUT_S = 5  # per hostname at start, counted from when its own lookup begins
-
-
 def start_workers(func, n: int) -> tuple[queue.SimpleQueue, queue.SimpleQueue]:
     """n threads: an item put into jobs comes out of results as (item, func(item)); a None
     ends one thread. Daemon threads, so a hanging DNS lookup never blocks quitting."""
@@ -202,7 +221,9 @@ def validate_targets(hosts: list[Host]):
         if is_ip(h.target):
             h.addr = h.target
             continue
-        if re.fullmatch(r"[\d.]+", h.target):
+        if is_ipv6(h.target):
+            h.invalid = "IPv6 is not supported (IPv4 only)"
+        elif re.fullmatch(r"[\d.]+", h.target):
             h.invalid = "not a valid IPv4 address"
         elif not HOSTNAME_RE.match(h.target):
             h.invalid = "not an IP address or hostname"
@@ -214,7 +235,7 @@ def validate_targets(hosts: list[Host]):
         def lookup(h: Host) -> list:
             started[h.order] = time.time()
             try:
-                return socket.getaddrinfo(h.target, None)
+                return socket.getaddrinfo(h.target, None, socket.AF_INET)
             except OSError:
                 return []
 
@@ -227,12 +248,10 @@ def validate_targets(hosts: list[Host]):
             try:
                 h, infos = results.get(timeout=0.2)
                 if pending.pop(h.order, None):  # else: answered after its timeout
-                    # prefer IPv4 (what these networks mostly use), otherwise the first address
-                    addrs = [i[4][0] for i in infos if i[0] == socket.AF_INET] or [i[4][0] for i in infos]
-                    if addrs:
-                        h.addr = addrs[0]
+                    if infos:
+                        h.addr = infos[0][4][0]
                     else:
-                        h.invalid = "hostname does not resolve"
+                        h.invalid = "hostname has no IPv4 address"
             except queue.Empty:
                 pass
             now = time.time()
@@ -309,12 +328,6 @@ class FpingBackend:
 
 
 # --------------------------------------------------------------------------- reverse dns
-
-DNS_WORKERS = 32  # reverse DNS queries in flight at once
-DNS_RETRY_S = 2  # between two rounds of retries
-DNS_PAUSE_S = 60  # while the DNS server doesn't answer: one query per this many seconds
-DNS_MAX_TRIES = 5  # queries without a usable answer before a host is given up
-
 
 def ptr_lookup(ip: str) -> tuple[bool, str | None]:
     """One reverse lookup -> (answered, name). "No PTR record" is an answer: (True, None).
@@ -400,14 +413,6 @@ def resolve_names(mon: "Monitor"):
         jobs.put(None)
 
 
-def is_ip(target: str) -> bool:
-    try:
-        ipaddress.ip_address(target)
-        return True
-    except ValueError:
-        return False
-
-
 # --------------------------------------------------------------------------- monitor
 
 class Monitor:
@@ -428,7 +433,9 @@ class Monitor:
         self.rounds = 0
         self.last_round_s = 0.0
         self.view = "compact"  # "v" toggles detail
-        self.show_fqdn = False  # "n" toggles
+        self.names = "label"  # "n" cycles label -> dns -> ip
+        self.cs = CHARSETS[args.charset]  # "g" cycles
+        self.sticky = ""  # warning shown in the header until the next key
         self.dns_pending = 0  # hosts still waiting for a reverse-DNS answer
         self.dns_paused = False  # DNS server not answering, only probing once a minute
         self.stop = threading.Event()
@@ -446,8 +453,12 @@ class Monitor:
         self.baseline_path = baseline_path
         self.baseline_seen: set[str] = set()
         self.baseline_dirty = False
+        self._in_round = False  # host events of a round are collected, then logged per group
+        self._pending: dict[tuple[str, str], list] = {}  # (kind, group) -> [(host, msg, style, outage s)]
+        self.outages_by_group: dict[str, list] = {}  # group with DOWN hosts -> [since, orders of its DOWN hosts]
+        self.all_down_log: list[list] = []  # [since, until or None] while every watched host was DOWN
         self.logfile = open(args.log, "a", encoding="utf-8")
-        self.event(None, f"started: {len(hosts)} hosts in {len(self.groups)} groups via fping, "
+        self.event(None, f"started: {len(hosts)} hosts in {len(self.groups)} group{'s' * (len(self.groups) != 1)} via fping, "
                          f"window={args.window} warn>={args.warn} loss>={args.loss} down>={args.down}", "cyan")
         for h in hosts:
             if h.invalid:
@@ -463,6 +474,8 @@ class Monitor:
         try:
             with open(self.baseline_path, encoding="utf-8") as fh:
                 data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError("not a JSON object")
             self.baseline_seen = set(data.get("seen", []))
             saved = datetime.fromisoformat(data["saved"])
         except (OSError, ValueError, KeyError, TypeError) as e:
@@ -479,6 +492,7 @@ class Monitor:
                          f"(saved {saved:%Y-%m-%d %H:%M}, {fmt_dur(age)} ago) - they alarm if unreachable",
                    "cyan")
         if age > 24 * 3600:
+            self.sticky = f"baseline is {fmt_dur(age)} old - new migration? restart with --fresh (any key hides this)"
             self.event(None, "baseline is older than 24h - start with --fresh if this is a new migration",
                        "bold yellow")
 
@@ -496,13 +510,74 @@ class Monitor:
             self.event(None, f"cannot save baseline {self.baseline_path}: {e}", "yellow")
 
     # -- events
-    def event(self, host: Host | None, msg: str, style: str):
+    def event(self, host: Host | None, msg: str, style: str, group: str | None = None,
+              screen: bool = True, log: bool = True):
+        """One event line on screen and in the log. group: a line about a whole group (no host)."""
         now = datetime.now()
         who = host.who + " " if host else ""
-        self.events.append(Text.assemble((f"{now:%H:%M:%S} ", "dim"), (who, "bold"), (msg, style)))
-        grp = f"[{host.group}] " if host else ""
-        self.logfile.write(f"{now.isoformat(timespec='seconds')} {grp}{who}{msg}\n")
-        self.logfile.flush()
+        grp = host.group if host else group
+        if screen:
+            self.events.append(Text.assemble((f"{now:%H:%M:%S} ", "dim"), (f"[{group}] " if group else "", "bold"),
+                                             (who, "bold"), (msg, style)))
+        if log:
+            self.logfile.write(f"{now.isoformat(timespec='seconds')} {f'[{grp}] ' if grp else ''}{who}{msg}\n")
+            self.logfile.flush()
+
+    def _host_event(self, h: Host, kind: str, msg: str, style: str, outage: float = 0.0):
+        """During a ping round, host events are collected and logged per group by _flush_events."""
+        if self._in_round:
+            self._pending.setdefault((kind, h.group), []).append((h, msg, style, outage))
+        else:
+            self.event(h, msg, style)
+
+    def _flush_events(self, now: float):
+        """Writes the host events of a round: several hosts of a group with the same event make one
+        line on screen (the log still gets every host); then group outages and the ALL DOWN check."""
+        for (kind, group), items in self._pending.items():
+            if len(items) == 1:
+                self.event(*items[0][:3])
+                continue
+            text, style = GROUP_EVENTS[kind]
+            text = f"{len(items)} {text}"
+            if kind == "UP":
+                still = sum(1 for h in self.groups[group] if h.state == DOWN)
+                text += f" (longest outage {fmt_dur(max(i[3] for i in items))})" + (f", {still} still DOWN" if still else "")
+            self.event(None, text, style, group=group)
+            for h, msg, st, _ in items:
+                self.event(h, msg, st, screen=False)
+        self._pending.clear()
+
+        for g, members in self.groups.items():  # "[group] all 70 back after 7:29"
+            down = [h for h in members if h.state == DOWN]
+            out = self.outages_by_group.get(g)
+            if down:
+                if out is None:
+                    out = self.outages_by_group[g] = [min(h.miss_streak_start or now for h in down), set()]
+                out[1].update(h.order for h in down)
+            elif out is not None:
+                del self.outages_by_group[g]
+                hit = [h for h in members if h.order in out[1]]
+                ignored = sum(1 for h in hit if h.ignored_at is not None)
+                if len(hit) >= 2 and len(hit) > ignored:  # one host: its own UP line says it all
+                    dur = fmt_dur(now - out[0])
+                    self.event(None, f"all {len(hit)} back after {dur}" if not ignored else
+                               f"no DOWN hosts left after {dur}: {len(hit) - ignored} back, {ignored} ignored",
+                               "bold green", group=g)
+
+        watched = [h for h in self.hosts if h.ever_up and h.ignored_at is None]
+        all_down = len(watched) >= ALL_DOWN_MIN and all(h.state == DOWN for h in watched)
+        ongoing = bool(self.all_down_log) and self.all_down_log[-1][1] is None
+        if all_down and not ongoing:
+            self.all_down_log.append([now, None])
+            self.event(None, f"ALL {len(watched)} watched hosts are DOWN at once - "
+                             f"check pingT's own network connection first", "bold white on magenta")
+        elif ongoing and not all_down:
+            self.all_down_log[-1][1] = now
+            self.event(None, f"ALL DOWN over after {fmt_dur(now - self.all_down_log[-1][0])} - hosts answer again",
+                       "green")
+
+    def all_down(self) -> bool:
+        return bool(self.all_down_log) and self.all_down_log[-1][1] is None
 
     # -- state machine
     def _evaluate(self, h: Host) -> str:
@@ -527,8 +602,8 @@ class Monitor:
             if h.consec_ok < self.args.down:
                 return
             h.ignore_log[-1][1] = now
-            self.event(h, f"BACK after being ignored for {fmt_dur(now - h.ignored_at)} - watched again",
-                       "bold green")
+            self._host_event(h, "BACK", f"BACK after being ignored for {fmt_dur(now - h.ignored_at)} - watched again",
+                             "bold green")
             h.ignored_at, h.consec_ok = None, 0
             h.ever_up = self.baseline_dirty = True
             h.state = UNKNOWN  # this reply is recorded below as the first one of a watched host
@@ -536,7 +611,7 @@ class Monitor:
             h.ever_up = True
             self.baseline_dirty = True
             if h.state == NEVER:
-                self.event(h, f"FIRST REPLY (silent for {h.consec_miss} pings)", "cyan")
+                self._host_event(h, "FIRST", f"FIRST REPLY (silent for {h.consec_miss} pings)", "cyan")
             # misses from before its first reply are not loss
             h.history.clear()
             h.sent -= h.lost
@@ -565,15 +640,15 @@ class Monitor:
         h.state = new
         if new == DOWN:
             h.outages += 1
-            self.event(h, f"DOWN  ({h.consec_miss} missed in a row)", "bold white on red")
+            self._host_event(h, "DOWN", f"DOWN  ({h.consec_miss} missed in a row)", "bold white on red")
         elif old == DOWN:
             dur = now - streak_start if streak_start else 0.0
             h.longest_outage = max(h.longest_outage, dur)
-            self.event(h, f"UP    after {fmt_dur(dur)} ({streak} lost)", "bold green")
+            self._host_event(h, "UP", f"UP    after {fmt_dur(dur)} ({streak} lost)", "bold green", dur)
         elif new == LOSS:
-            self.event(h, f"LOSS  {h.window_lost}/{len(h.history)} lost in window", "bold red")
+            self._host_event(h, "LOSS", f"LOSS  {h.window_lost}/{len(h.history)} lost in window", "bold red")
         elif old == LOSS and new in (OK, WARN):
-            self.event(h, f"CLEAR loss back to {h.window_lost}/{len(h.history)}", "green")
+            self._host_event(h, "CLEAR", f"CLEAR loss back to {h.window_lost}/{len(h.history)}", "green")
 
     def run_pings(self):
         targets = list(self.by_addr)  # unique IPs of all valid hosts
@@ -592,9 +667,14 @@ class Monitor:
                         self.event(None, f"pinging works again after {self.ping_errors} rounds with errors",
                                    "green")
                         self.ping_errors = 0
-                    for addr, rtt in results.items():
-                        for h in self.by_addr.get(addr, ()):
-                            self._record(h, rtt, now)
+                    self._in_round = True
+                    try:
+                        for addr, rtt in results.items():
+                            for h in self.by_addr.get(addr, ()):
+                                self._record(h, rtt, now)
+                    finally:
+                        self._in_round = False
+                        self._flush_events(now)
                     self.rounds += 1
                     self.last_round_s = now - t0
                     self.last_round_end = now
@@ -631,6 +711,7 @@ class Monitor:
         """Handles one key. True = quit."""
         now = time.time()
         with self.lock:
+            self.sticky = ""  # any key hides a sticky warning
             if self.ask:
                 self._answer(key, now)
                 return False
@@ -644,10 +725,15 @@ class Monitor:
             elif key == "v":
                 self.view = "detail" if self.view == "compact" else "compact"
             elif key == "n":
-                if self.args.dns or self.show_fqdn:
-                    self.show_fqdn = not self.show_fqdn
-                else:
-                    self.notice = ("reverse DNS is off (--no-dns)", now + 3)
+                modes = [m for m in NAME_MODES if m != "dns" or self.args.dns]
+                self.names = modes[(modes.index(self.names) + 1) % len(modes)]
+                if not self.args.dns:  # the header shows the mode; only say why DNS is skipped
+                    self.notice = ("names: label / IP - DNS names are off (--no-dns)", now + 3)
+            elif key == "g":
+                names = list(CHARSETS)
+                self.cs = CHARSETS[names[(names.index(self.cs.name) + 1) % len(names)]]
+                self.notice = (f"characters: {self.cs.name} - keep it with --charset {self.cs.name} "
+                               f"or PINGT_CHARSET={self.cs.name}", now + 5)
         return False
 
     def expire(self):
@@ -691,6 +777,7 @@ class Monitor:
             h.reset(keep_outage=True)
         self.started = time.time()
         self.rounds = 0
+        self.last_ignore = None  # undo would bring back the stats from before the reset
         self.event(None, "stats reset", "cyan")
 
     # -- ignore: the operator takes the DOWN hosts of a group out of the alarms (clients that went home)
@@ -763,7 +850,7 @@ class Monitor:
         with self.lock:
             if self.view == "compact":
                 body, used = self._compact(width, height - 1)
-            else:  # every host as a cell, events get at most 3 lines
+            else:  # every host as a cell; the grid leaves at least 3 lines for events
                 grid, used = self._cells(self.hosts, width, max(1, height - 1 - min(self.args.events, 3)),
                                          with_target=False)
                 body = [grid]
@@ -781,6 +868,10 @@ class Monitor:
         segs: list[tuple[int, str, str]] = [(0, " pingT ", "bold black on cyan")]
         if problem:
             segs.append((0, f" {problem} ", "bold white on magenta"))
+        if self.all_down():
+            segs.append((0, " ALL DOWN - check pingT's own network ", "bold white on magenta"))
+        if self.sticky:
+            segs.append((0, f" {self.sticky} ", "bold black on yellow"))
         if notice and time.time() < expires:
             segs.append((0, f" {notice} ", "bold black on yellow"))
         segs += [
@@ -795,14 +886,13 @@ class Monitor:
             segs.append((1, f"ignored {counts[IGNORED]}", "yellow"))
         if counts[INVALID]:
             segs.append((1, f"invalid {counts[INVALID]}", "bold magenta"))
-        segs.append((2, f"names:{'FQDN' if self.show_fqdn else 'label'}",
-                     "bold cyan" if self.show_fqdn else "dim"))
+        segs.append((2, f"names:{self.names}", "dim" if self.names == "label" else "bold cyan"))
         if self.dns_pending:
             segs.append((3, f"dns no answer, {self.dns_pending} left (probing 1/min)" if self.dns_paused
                             else f"dns {self.dns_pending} left", "yellow" if self.dns_paused else "dim"))
         segs.append((3, f"fping {fmt_dur(time.time() - self.started)} "
                         f"#{self.rounds} {self.last_round_s:.1f}s", "dim"))
-        segs.append((4, "[q]uit [r]eset [v]iew [n]ames [x]ignore", "dim"))
+        segs.append((4, "[q]uit [r]eset [v]iew [n]ames [x]ignore [g]lyphs", "dim"))
 
         keep = segs
         while sum(len(t) + 1 for _, t, _ in keep) > width:
@@ -810,12 +900,17 @@ class Monitor:
             if worst == 0:
                 break
             keep = [seg for seg in keep if seg[0] != worst]
-        out = Text(no_wrap=True, overflow="ellipsis")
+        out = Text(no_wrap=True, overflow=self.cs.overflow)
         for i, (_, text, style) in enumerate(keep):
             if i:
                 out.append(" ")
             out.append(text, style)
         return out
+
+    def _separator(self, title: str, width: int, style: str) -> Text:
+        """"─ title ───…" across the screen."""
+        line = self.cs.line
+        return Text(f"{line} {title} " + line * max(0, width - len(title) - 3), style=style)
 
     def _append_events(self, parts: list, width: int, lines: int):
         """Event panel: separator + most recent events, limited to --events and free lines."""
@@ -823,12 +918,16 @@ class Monitor:
         if lines <= 0:
             return
         if lines > 1:
-            parts.append(Text("─ events " + "─" * max(0, width - 9), style="dim"))
+            parts.append(self._separator("events", width, "dim"))
             lines -= 1
         for e in list(self.events)[-lines:]:
             e = e.copy()
-            e.truncate(width, overflow="ellipsis")
+            e.truncate(width, overflow=self.cs.overflow)
             parts.append(e)
+
+    def _cut(self, text: str, width: int) -> str:
+        ell = self.cs.ell
+        return text if len(text) <= width else text[: max(0, width - len(ell))] + ell
 
     # compact view: one glyph per host per group line + problem list
     def _compact(self, width: int, height: int) -> tuple[list, int]:
@@ -837,19 +936,19 @@ class Monitor:
         mark_w = 2 if marks else 0
         prefix_w = mark_w + name_w + 1 + 8  # "name 123/456 "
         per_line = max(10, ((width - prefix_w + 1) // 11) * 10)  # blocks of 10 glyphs + space
-        lines: list[Text] = []
+        blocks: list[tuple[str, list[Text]]] = []  # (group, its lines)
         for gname, members in self.groups.items():
             # up / hosts that ever answered (silent-from-the-start hosts don't count)
             up, seen = back_counts(members)
             worst = min((h.state for h in members), key=SEVERITY.get)
-            label = gname if len(gname) <= name_w else gname[: name_w - 1] + "…"
+            lines: list[Text] = []
             for start in range(0, len(members), per_line):
                 t = Text(no_wrap=True, overflow="crop")
                 if start == 0:
                     if mark_w:
                         t.append(marks.get(gname, " "), "bold black on yellow" if gname in marks else "")
                         t.append(" ")
-                    t.append(label.ljust(name_w) + " ", STATE_STYLES[worst][1] or "bold")
+                    t.append(self._cut(gname, name_w).ljust(name_w) + " ", STATE_STYLES[worst][1] or "bold")
                     t.append(f"{up:>3}/{seen:<3} ",
                              "green" if all_back(up, seen) else STATE_STYLES[worst][0])
                 else:
@@ -857,17 +956,38 @@ class Monitor:
                 for i, h in enumerate(members[start:start + per_line]):
                     if i and i % 10 == 0:
                         t.append(" ")
-                    t.append(*GLYPHS[h.state])
+                    t.append(self.cs.glyphs[h.state], GLYPH_STYLES[h.state])
                 lines.append(t)
+            blocks.append((gname, lines))
 
         problems = sorted((h for h in self.hosts if h.state in (DOWN, LOSS, WARN, INVALID)),
                           key=lambda h: (SEVERITY[h.state], -h.window_lost, h.order))  # worst first
-        free = height - len(lines)
-        # problems get the rows they need at full detail; events get what's left (min 2 lines)
+        wanted = 0
         if problems:
             name_w, hist_w, show_pct = CELL_LAYOUTS[0]
             full_cols = max(1, (width + 1) // (cell_width(name_w + 16, hist_w, show_pct) + 1))
             wanted = math.ceil(len(problems) / full_cols)
+        # the group lines must not push problems and events off the screen: they keep some rows,
+        # and the groups that don't fit are summed up in one line
+        keep_rows = min(self.args.events, 2) + (1 + min(wanted, max(3, height // 3)) if problems else 0)
+        budget = max(1, height - keep_rows)
+        lines = [t for _, ls in blocks for t in ls]
+        if len(lines) > budget:
+            if marks:  # x dialog: the numbered groups first, so their numbers can be seen
+                blocks.sort(key=lambda b: b[0] not in marks)
+            lines, hidden = [], []
+            for gname, ls in blocks:  # whole groups in order, one row stays for the "more groups" line
+                if not hidden and len(lines) + len(ls) <= budget - 1:
+                    lines += ls
+                elif not hidden and not lines and budget > 1:  # one group bigger than the screen: its start
+                    lines = ls[: budget - 1]
+                else:
+                    hidden.append(gname)
+            lines.append(self._more_groups(hidden))
+
+        free = height - len(lines)
+        # problems get the rows they need at full detail; events get what's left (min 2 lines)
+        if problems:
             reserve = min(self.args.events, max(2, free - 1 - wanted))
         else:
             reserve = min(self.args.events, free - 1)
@@ -875,9 +995,8 @@ class Monitor:
         out: list = list(lines)
         used = len(lines)
         if prob_lines > 0:
-            title = f"─ problems ({len(problems)}) " if problems else "─ no problems "
-            out.append(Text(title + "─" * max(0, width - len(title)),
-                            style="bold red" if problems else "dim green"))
+            out.append(self._separator(f"problems ({len(problems)})" if problems else "no problems", width,
+                                       "bold red" if problems else "dim green"))
             used += 1
             if problems:
                 grid, rows = self._cells(problems, width, prob_lines, with_target=True)
@@ -885,11 +1004,22 @@ class Monitor:
                 used += rows
         return out, used
 
+    def _more_groups(self, hidden: list[str]) -> Text:
+        """One line for the groups that don't fit on the screen: how many, and their state."""
+        members = [h for g in hidden for h in self.groups[g]]
+        up, seen = back_counts(members)
+        counts = Counter(h.state for h in members)
+        state = ", ".join(f"{n} {name}" for n, name in ((counts[DOWN], "down"), (counts[LOSS], "loss"),
+                                                        (counts[WARN], "warn")) if n)
+        worst = min((h.state for h in members), key=SEVERITY.get) if members else OK
+        text = f"{self.cs.ell} {len(hidden)} more groups ({len(members)} hosts): back {up}/{seen}"
+        return Text(text + (f", {state}" if state else ""), no_wrap=True, overflow="crop",
+                    style="green" if all_back(up, seen) and not state else STATE_STYLES[worst][0])
+
     def _cells(self, hosts: list[Host], width: int, max_rows: int, with_target: bool):
         """Grid of host cells using the most detailed layout that fits in max_rows."""
-        # size from BOTH name variants, so toggling label/FQDN keeps every host in the same cell
-        name_len = max(max(len(self._name(h, with_target, fqdn=False)),
-                           len(self._name(h, with_target, fqdn=True))) for h in hosts)
+        # size from ALL name modes, so switching names keeps every host in the same cell
+        name_len = max(len(self._name(h, with_target, mode)) for h in hosts for mode in NAME_MODES)
         for name_w, hist_w, show_pct in CELL_LAYOUTS:
             name_w = min(name_w + (16 if with_target else 0), max(4, name_len))
             cell_w = cell_width(name_w, hist_w, show_pct)
@@ -899,9 +1029,10 @@ class Monitor:
         rows = min(max_rows, math.ceil(len(hosts) / cols))
         capacity = rows * cols
         shown = hosts if len(hosts) <= capacity else hosts[: capacity - 1]
-        cells = [self._cell(h, name_w, hist_w, show_pct, with_target) for h in shown]
+        now = time.time()
+        cells = [self._cell(h, name_w, hist_w, show_pct, with_target, now) for h in shown]
         if len(shown) < len(hosts):
-            cells.append(Text(f"… +{len(hosts) - len(shown)} more", style="bold red"))
+            cells.append(Text(f"{self.cs.ell} +{len(hosts) - len(shown)} more", style="bold red"))
         grid = Table.grid(padding=(0, 1))
         for _ in range(cols):
             grid.add_column(width=cell_w, no_wrap=True)
@@ -910,35 +1041,49 @@ class Monitor:
                            for c in range(cols)])
         return grid, rows
 
-    def _name(self, h: Host, with_target: bool, fqdn: bool | None = None) -> str:
-        """Display name; fqdn=None means the current mode (the 'n' toggle)."""
-        if self.show_fqdn if fqdn is None else fqdn:
-            name = h.fqdn or h.target  # no PTR record (or not looked up yet) -> IP
-            return f"{name} {h.target}" if with_target and name != h.target else name
-        if with_target and h.label != h.target:
-            return f"{h.label} {h.target}"
-        return h.label
+    def _name(self, h: Host, with_target: bool, mode: str | None = None) -> str:
+        """Display name in a name mode ('n' cycles label -> dns -> ip; None = the current one).
+        with_target adds the IP when the name isn't the IP itself."""
+        mode = mode or self.names
+        ip = h.addr or h.target
+        if mode == "ip":
+            return ip
+        name = (h.fqdn or ip) if mode == "dns" else h.label  # no DNS name (or not looked up yet) -> IP
+        return f"{name} {ip}" if with_target and name != ip else name
 
-    def _cell(self, h: Host, name_w: int, hist_w: int, show_pct: bool, with_target: bool) -> Text:
+    def _cell(self, h: Host, name_w: int, hist_w: int, show_pct: bool, with_target: bool, now: float) -> Text:
+        cs = self.cs
         dot_style, name_style = STATE_STYLES[h.state]
         t = Text(no_wrap=True, overflow="crop")
-        t.append({DOWN: "✖ ", INVALID: "? ", IGNORED: "- "}.get(h.state, "● "), dot_style)
-        name = self._name(h, with_target)
-        name = name if len(name) <= name_w else name[: name_w - 1] + "…"
-        t.append(name.ljust(name_w), name_style)
+        t.append(cs.marks.get(h.state, cs.marks[OK]) + " ", dot_style)
+        t.append(self._cut(self._name(h, with_target), name_w).ljust(name_w), name_style)
         if h.state == INVALID:
             t.append(f" invalid: {h.invalid}", "magenta")
             return t
+        down_for = now - h.miss_streak_start if h.state == DOWN and h.miss_streak_start else None
         if show_pct:
-            pct = h.window_loss_pct
-            t.append(f"{pct:4.0f}%" if h.history else "   -%",
-                     "dim" if pct == 0 else ("yellow" if h.state != DOWN else "bold red"))
+            if down_for is not None:  # the loss % of a DOWN host says nothing: its time instead
+                t.append(f"{fmt_short(down_for):>5}" if hist_w < 10 else " " * 5, "bold red")
+            elif h.state in (NEVER, UNKNOWN, IGNORED) or not h.history:  # nothing to measure
+                t.append("    -", "dim")
+            else:
+                pct = h.window_loss_pct
+                t.append(f"{pct:4.0f}%", "dim" if pct == 0 else ("yellow" if h.state != DOWN else "bold red"))
         if hist_w:
             t.append(" ")
-            recent = list(h.history)[-hist_w:]
-            t.append("·" * (hist_w - len(recent)), "dim")
+            recent = list(h.history)
+            if down_for is not None and hist_w >= 10:
+                t.append(f"down {fmt_short(down_for):<5}", "bold red")
+                recent = recent[-(hist_w - 11):] if hist_w > 11 else []
+                if hist_w > 10:
+                    t.append(" ")
+                width = max(0, hist_w - 11)
+            else:
+                recent = recent[-hist_w:]
+                width = hist_w
+            t.append(cs.empty * (width - len(recent)), "dim")
             for rtt in recent:
-                t.append(*(("×", "bold red") if rtt is None else spark(rtt)))
+                t.append(*((cs.lost, "bold red") if rtt is None else spark(rtt, cs)))
         return t
 
 
@@ -967,22 +1112,83 @@ STATE_STYLES = {
     DOWN: ("bold white on red", "bold white on red"),
 }
 
-GLYPHS = {
-    UNKNOWN: ("·", "dim"),
-    NEVER: ("○", "dim"),
-    IGNORED: ("-", "dim"),
-    INVALID: ("?", "bold magenta"),
-    OK: ("●", "green"),
-    WARN: ("●", "yellow"),
-    LOSS: ("●", "bold red"),
-    DOWN: ("X", "bold white on red"),
+# kind of host event -> (text after the count, style) when several hosts of a group have it in one round
+GROUP_EVENTS = {
+    "DOWN": ("hosts DOWN", "bold white on red"),
+    "UP": ("hosts UP", "bold green"),
+    "LOSS": ("hosts with LOSS", "bold red"),
+    "CLEAR": ("hosts: loss cleared", "green"),
+    "FIRST": ("hosts answered for the first time", "cyan"),
+    "BACK": ("ignored hosts are BACK - watched again", "bold green"),
 }
 
-SPARK = [(1, "▁"), (2, "▂"), (5, "▃"), (10, "▄"), (30, "▅"), (100, "▆"), (math.inf, "▇")]
+NAME_MODES = ("label", "dns", "ip")
+
+GLYPH_STYLES = {UNKNOWN: "dim", NEVER: "dim", IGNORED: "dim", INVALID: "bold magenta",
+                OK: "green", WARN: "yellow", LOSS: "bold red", DOWN: "bold white on red"}
 
 
-def spark(rtt: float) -> tuple[str, str]:
-    return next(ch for limit, ch in SPARK if rtt < limit), ("green" if rtt < 30 else "yellow")
+@dataclass(frozen=True)
+class Charset:
+    """The characters pingT draws with. PuTTY's fonts lack some of the unicode ones (README "Troubleshooting")."""
+    name: str
+    glyphs: dict  # state -> one character in the group lines
+    marks: dict  # state -> start of a host cell (problems list, box view); the rest get marks[OK]
+    lost: str  # a lost ping in the recent-pings bar
+    empty: str  # no ping yet
+    spark: tuple  # (rtt below this many ms, character), fastest first
+    line: str  # separator lines
+    ell: str  # marks cut-off text
+    box: box.Box  # summary tables
+    overflow: str  # how rich cuts text that doesn't fit
+
+
+CHARSETS = {cs.name: cs for cs in (
+    Charset("unicode", {UNKNOWN: "·", NEVER: "○", IGNORED: "-", INVALID: "?", OK: "●", WARN: "●", LOSS: "●", DOWN: "X"},
+            {DOWN: "✖", INVALID: "?", IGNORED: "-", OK: "●"}, "×", "·",
+            ((1, "▁"), (2, "▂"), (5, "▃"), (10, "▄"), (30, "▅"), (100, "▆"), (math.inf, "▇")),
+            "─", "…", box.HEAVY_HEAD, "ellipsis"),
+    # only characters of the Windows core fonts (WGL4: Courier New, Lucida Console, Consolas)
+    Charset("safe", {UNKNOWN: "·", NEVER: "○", IGNORED: "-", INVALID: "?", OK: "●", WARN: "●", LOSS: "●", DOWN: "X"},
+            {DOWN: "X", INVALID: "?", IGNORED: "-", OK: "●"}, "×", "·",
+            ((2, "░"), (10, "▒"), (100, "▓"), (math.inf, "█")),
+            "─", "…", box.SQUARE, "ellipsis"),
+    # 7-bit ASCII: works even when the terminal's character set is wrong
+    Charset("ascii", {UNKNOWN: ".", NEVER: ".", IGNORED: "-", INVALID: "?", OK: "o", WARN: "o", LOSS: "o", DOWN: "X"},
+            {DOWN: "X", INVALID: "?", IGNORED: "-", OK: "o"}, "x", ".",
+            ((1, "_"), (2, "-"), (5, "="), (10, "+"), (30, "*"), (100, "#"), (math.inf, "@")),
+            "-", "...", box.ASCII, "crop"),
+)}
+
+
+def charset_option(ap: argparse.ArgumentParser):
+    """--charset for pingT and scan.py; the default comes from $PINGT_CHARSET, else unicode."""
+    env = os.environ.get("PINGT_CHARSET", "").strip().lower()
+    ap.add_argument("--charset", choices=list(CHARSETS), default=env if env in CHARSETS else "unicode",
+                    help="characters to draw with: unicode (default), safe (all Windows fonts, PuTTY), ascii; "
+                         "default from $PINGT_CHARSET")
+    ap.add_argument("--charset-test", action="store_true", help="print every character set and exit")
+    return env
+
+
+def check_charset(ap: argparse.ArgumentParser, args, env: str):
+    if env and env not in CHARSETS:
+        ap.error(f"PINGT_CHARSET={env!r} is unknown - use one of: {', '.join(CHARSETS)}")
+    if args.charset_test:
+        print("Pick the first line where every character looks right, then use --charset NAME\n"
+              "or put  export PINGT_CHARSET=NAME  into your ~/.bashrc:\n")
+        for cs in CHARSETS.values():
+            b = cs.box
+            print(f"  {cs.name:<8} {''.join(dict.fromkeys(cs.glyphs.values()))}  {cs.marks[DOWN]} {cs.lost}{cs.empty}  "
+                  f"{''.join(ch for _, ch in cs.spark)}  {cs.line * 3} {cs.ell}  "
+                  f"{b.top_left}{b.top}{b.top_divider}{b.top_right}{b.head_vertical}"
+                  f"{b.head_row_left}{b.head_row_horizontal}{b.head_row_cross}{b.head_row_right}"
+                  f"{b.bottom_left}{b.bottom_divider}{b.bottom_right}")
+        sys.exit(0)
+
+
+def spark(rtt: float, cs: Charset) -> tuple[str, str]:
+    return next(ch for limit, ch in cs.spark if rtt < limit), ("green" if rtt < 30 else "yellow")
 
 
 def fmt_dur(sec: float) -> str:
@@ -992,10 +1198,21 @@ def fmt_dur(sec: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def fmt_short(sec: float) -> str:
+    """A duration in at most 5 characters: 4:12, 59:59, 1h35, 99h59, 5d."""
+    sec = int(sec)
+    if sec < 3600:
+        return f"{sec // 60}:{sec % 60:02d}"
+    if sec < 100 * 3600:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}"
+    return f"{sec // 86400}d"
+
+
 # --------------------------------------------------------------------------- keyboard
 
-# one key: an escape sequence (arrow keys, F-keys: ESC [ ... or ESC O x), a lone ESC, or one character
-KEY_SEQ = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|O.)?|.", re.S)
+# one key: an escape sequence (arrow keys, F-keys: ESC [ ... or ESC O x; Alt+key: ESC x), a lone ESC,
+# or one character
+KEY_SEQ = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|O.|[^\x1b])?|.", re.S)
 KEY_SEQ_OPEN = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*|O)?\Z")  # input ends inside an escape sequence
 
 
@@ -1018,7 +1235,7 @@ class Keyboard:
 
     def keys(self, timeout: float) -> list[str]:
         """The keys pressed within timeout, lower case, Esc as "esc". Escape sequences
-        (arrow keys, F-keys) are dropped, so they can't answer or cancel anything."""
+        (arrow keys, F-keys, Alt+key) are dropped, so they can't answer or cancel anything."""
         if not self.enabled:
             time.sleep(timeout)
             return []
@@ -1042,15 +1259,19 @@ class Keyboard:
 # --------------------------------------------------------------------------- main
 
 def print_summary(console: Console, mon: Monitor):
-    """After exit: every host that lost anything, worst first, plus per-group totals."""
+    """After exit: every host that lost anything, worst first, plus per-group totals.
+    Names, groups and DNS answers go through escape(): "[old] sw2" must not be read as rich markup."""
     def host_line(h: Host, color: str, rest: str):
-        console.print(f"  [{color}]{h.target:<16}[/{color}] {h.fqdn or h.label:<30} {rest}")
+        console.print(f"  [{color}]{escape(h.target):<16}[/{color}] {escape(f'{h.fqdn or h.label:<30}')} {rest}")
+
+    def table(**kw) -> Table:
+        return Table(header_style="bold", box=mon.cs.box, **kw)
 
     up, seen = back_counts(mon.hosts)
     console.print(f"\n[bold]Summary[/bold] - {fmt_dur(time.time() - mon.started)}, {mon.rounds} rounds, "
                   f"[{'green' if all_back(up, seen) else 'bold red'}]back {up}/{seen}[/] "
                   f"hosts that answered at some point")
-    gt = Table(header_style="bold")
+    gt = table()
     for col in ("group", "hosts", "back", "not back", "silent", "ignored", "with loss", "outages", "loss %"):
         gt.add_column(col, justify="left" if col == "group" else "right")
     for gname, members in mon.groups.items():
@@ -1060,7 +1281,7 @@ def print_summary(console: Console, mon: Monitor):
         lost = sum(h.lost for h in seen_m)
         affected = sum(1 for h in seen_m if h.lost)
         outages = sum(h.outages for h in seen_m)
-        gt.add_row(gname, str(len(members)), str(back), str(seen_n - back),
+        gt.add_row(escape(gname), str(len(members)), str(back), str(seen_n - back),
                    str(sum(1 for h in members if h.state == NEVER)),
                    str(sum(1 for h in members if h.state == IGNORED)), str(affected), str(outages),
                    f"{100.0 * lost / sent if sent else 0:.2f}",
@@ -1070,18 +1291,24 @@ def print_summary(console: Console, mon: Monitor):
 
     problem = mon.ping_problem()
     if problem:
-        console.print(f"[bold white on magenta] {problem} [/] - the last states may be outdated")
+        console.print(f"[bold white on magenta] {escape(problem)} [/] - the last states may be outdated")
+    if mon.all_down_log:
+        now = time.time()
+        spans = ", ".join(f"{datetime.fromtimestamp(a):%H:%M:%S} for {fmt_dur((b or now) - a)}"
+                          for a, b in mon.all_down_log)
+        console.print(f"[bold white on magenta] ALL watched hosts were DOWN at once ({len(mon.all_down_log)}x) [/] "
+                      f"{spans} - probably pingT's own network, not the migration")
     not_back = [h for h in mon.hosts if h.ever_up and not is_back(h)]
     if not_back:
         console.print(f"[bold red]NOT BACK ({len(not_back)}):[/bold red] answered earlier, not answering now")
         for h in not_back:
             note = "  (known from baseline, no reply in this run)" if h.from_baseline and h.sent == h.lost else ""
-            host_line(h, "red", f"[dim]{h.group}[/dim]  {h.state}{note}")
+            host_line(h, "red", f"[dim]{escape(h.group)}[/dim]  {h.state}{note}")
     invalid = [h for h in mon.hosts if h.invalid]
     if invalid:
         console.print(f"[bold magenta]INVALID entries, not pinged ({len(invalid)}):[/bold magenta]")
         for h in invalid:
-            host_line(h, "magenta", f"[dim]{h.where}[/dim]  {h.invalid}")
+            host_line(h, "magenta", f"[dim]{escape(h.where)}[/dim]  {escape(h.invalid)}")
     ignored = [h for h in mon.hosts if h.ignore_log]
     if ignored:
         still = sum(1 for h in ignored if h.ignored_at is not None)
@@ -1092,11 +1319,11 @@ def print_summary(console: Console, mon: Monitor):
                              + (f" back {datetime.fromtimestamp(back):%H:%M}" if back else "")
                              for at, back in h.ignore_log)
             status = "still ignored" if h.ignored_at is not None else f"back, {h.state}"
-            host_line(h, "yellow", f"[dim]{h.group}[/dim]  {status}  [dim]{when}[/dim]")
+            host_line(h, "yellow", f"[dim]{escape(h.group)}[/dim]  {status}  [dim]{when}[/dim]")
     silent = [h for h in mon.hosts if not h.ever_up and not h.invalid and h.ignored_at is None]
     if silent:
         console.print(f"[dim]Silent the whole time ({len(silent)}): "
-                      + ", ".join(h.who for h in silent) + "[/dim]")
+                      + escape(", ".join(h.who for h in silent)) + "[/dim]")
 
     # h.outages without h.lost: DOWN at an r r reset, back before it missed another ping
     bad = sorted((h for h in mon.hosts if h.ever_up and (h.lost or h.outages)),
@@ -1107,26 +1334,29 @@ def print_summary(console: Console, mon: Monitor):
     with_fqdn = any(h.fqdn and h.fqdn != h.label for h in bad)
     cols = ["host"] + (["fqdn"] if with_fqdn else []) + \
            ["target", "group", "state", "sent", "lost", "loss %", "outages", "longest"]
-    table = Table(title=f"Hosts with loss ({len(bad)})", header_style="bold")
+    lt = table(title=f"Hosts with loss ({len(bad)})")
     for col in cols:
-        table.add_column(col, justify="right" if col in ("sent", "lost", "loss %", "outages", "longest") else "left")
+        lt.add_column(col, justify="right" if col in ("sent", "lost", "loss %", "outages", "longest") else "left")
     now = time.time()
     for h in bad:
         longest = h.longest_outage
         if h.state == DOWN and h.miss_streak_start:  # still down: count the ongoing outage
             longest = max(longest, now - h.miss_streak_start)
         pct = 100.0 * h.lost / h.sent if h.sent else 0.0
-        row = [h.label] + ([h.fqdn or "-"] if with_fqdn else []) + \
-              [h.target, h.group, h.state, str(h.sent), str(h.lost), f"{pct:.1f}",
+        row = [escape(h.label)] + ([escape(h.fqdn or "-")] if with_fqdn else []) + \
+              [escape(h.target), escape(h.group), h.state, str(h.sent), str(h.lost), f"{pct:.1f}",
                str(h.outages), fmt_dur(longest) if h.outages else "-"]
-        table.add_row(*row, style="red" if h.outages or h.state == DOWN else "yellow")
-    console.print(table)
+        lt.add_row(*row, style="red" if h.outages or h.state == DOWN else "yellow")
+    console.print(lt)
 
 
 def save_summary(mon: Monitor, path: str) -> str | None:
     """Plain-text copy of the summary; returns an error message or None."""
     buf = io.StringIO()
-    print_summary(Console(file=buf, width=140, color_system=None, force_terminal=False), mon)
+    try:
+        print_summary(Console(file=buf, width=140, color_system=None, force_terminal=False), mon)
+    except Exception as e:  # never lose the file to a rendering problem: write what was rendered
+        buf.write(f"\n(summary incomplete: {type(e).__name__}: {e})\n")
     try:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(f"Timmy Pinger summary, written {datetime.now():%Y-%m-%d %H:%M:%S}\n")
@@ -1153,7 +1383,9 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="ignore the saved baseline and start a new one")
     ap.add_argument("--no-dns", dest="dns", action="store_false",
                     help="no reverse DNS lookups at all")
+    env = charset_option(ap)
     args = ap.parse_args()
+    check_charset(ap, args, env)
 
     checks = [
         (args.window >= 1, "-w/--window must be >= 1"),
@@ -1195,8 +1427,8 @@ def main():
     backend = FpingBackend(args.timeout)
     needed = backend.round_time(len(hosts) - len(invalid))  # worst case: every host times out
     if needed > 1.5 * args.interval:
-        print(f"note: with many hosts down a round can take ~{needed:.1f}s > interval {args.interval}s; "
-              f"rounds then run back-to-back", file=sys.stderr)
+        print(f"note: with {len(hosts) - len(invalid)} hosts a round can take ~{needed:.1f}s when many of them "
+              f"are down (> interval {args.interval}s); rounds then run back-to-back", file=sys.stderr)
     if invalid and sys.stdin.isatty():
         time.sleep(3)  # let the warnings be read before the dashboard takes over the screen
 
