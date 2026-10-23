@@ -1,4 +1,4 @@
-"""Shared test helpers: a fake-fping environment and a tiny pty driver that runs pingT / scan.py
+"""Shared test helpers: a fake-fping environment and a tiny pty driver that runs pingT.py / scanT.py
 in a real terminal, sends keys and reads the screen."""
 from __future__ import annotations
 

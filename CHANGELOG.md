@@ -3,6 +3,44 @@
 What changed between versions — for everyone who already knows pingT.
 How the numbers work: [DECISIONS.md](DECISIONS.md) "Version numbers".
 
+## 3.0 — 2026-10-23
+
+**Changed — check your habits and scripts**
+
+- **The commands are now `python3 pingT.py` and `python3 scanT.py`** (before: `./pingT` and
+  `./scan.py`). The old names are gone.
+- **Setup:** one Python 3.11 environment in your home folder (`~/.venv`), activated before
+  every start — README "Setup (once)".
+- **pingT writes into the `logs/` folder next to `pingT.py`** (event log, summaries,
+  baseline), no matter which folder you start it from. Move or delete them there after a
+  migration. `--log` still puts them somewhere else.
+- `--charset-test` is gone: press `g` while pingT runs to try the character sets.
+- `r` `r` no longer deletes anything from the summary: what the counters held before the
+  reset gets its own table ("Before the reset at …").
+
+**New**
+
+- The summary has a **timeline of the group outages**: when 2 or more hosts of a group went
+  down, when the group was complete again and how long it took — or that it is still down.
+- `--help` of both tools is grouped, with examples (and pingT's keys).
+- The README has two explicit parts: quick start and everyday use, and the reference.
+- Credits: `pingT 3.0 - by Timmy` at the right end of the top line (when there is room), in
+  `--help`, `--version` and the summary file.
+
+**Fixed**
+
+- Restarting pingT from another folder lost the baseline (it was next to the log in the
+  current folder) - now it is always in `logs/`.
+- After `r` `r` the runtime in the top line started again at 0:00; it now counts from the
+  start, and the summary says since when the counters run.
+- Leaving pingT after the SSH session dropped could end with a traceback when resetting the
+  terminal (the summary was saved anyway).
+
+**Inside**
+
+- The code is rebuilt as the package `timmy_pinger/` (one module per job, see README "For
+  the maintainer"); `pingT.py` and `scanT.py` only start it. Everything else behaves as in 2.0.
+
 ## 2.0 — 2026-10-23
 
 The first numbered version. Earlier copies had no version number (1.x).

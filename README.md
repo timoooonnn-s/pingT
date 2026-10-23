@@ -4,17 +4,76 @@
 It is made for switch migrations: you see at a glance which devices went down during
 the cut-over and whether **all of them came back** afterwards.
 
-A second, optional tool — the **scanner** — finds the reachable hosts in your subnets
-and writes that host list for you.
+**scanT**, the optional second tool, finds the reachable hosts in your subnets and writes
+that host list for you.
+
+This README describes version **3.0** (`python3 pingT.py --version`). What changed since
+earlier versions: [CHANGELOG.md](CHANGELOG.md).
+
+**Part 1 — [Quick start and everyday use](#part-1-quick-start-and-everyday-use)** — everything
+you need on migration day:
+[setup](#setup-once) ·
+[quick start](#quick-start) ·
+[what you see](#what-you-see) ·
+[on migration day](#on-migration-day) ·
+[the scanner scanT](#the-scanner-scant-optional)
+
+**Part 2 — [Reference](#part-2-reference)** — every detail, look things up when you need them:
+[pingT options](#pingt-options) ·
+[scanT options](#scant-options) ·
+[states and alarms](#states-and-alarms) ·
+[the screen in detail](#the-screen-in-detail) ·
+[host list format](#host-list-format) ·
+[files pingT writes](#files-pingt-writes) ·
+[DNS names](#dns-names) ·
+[how often hosts are pinged](#how-often-hosts-are-pinged) ·
+[troubleshooting](#troubleshooting) ·
+[for the maintainer](#for-the-maintainer)
 
 ---
 
-## Quick start
+# Part 1: Quick start and everyday use
 
-**1. Go to the Timmy Pinger folder**
+## Setup (once)
+
+**1. Get the code** into your home folder on the server:
 
 ```bash
-cd pingT        # wherever you put it
+cd ~/git
+git clone <REPO-URL>
+```
+
+Later, to get the newest version: `cd ~/git/pingT && git pull`.
+
+`fping`, which does the actual pinging, is already installed on the server. Nothing needs root.
+
+**2. Create the Python environment** — once: one environment with Python 3.11 in your home
+folder, with the package pingT needs (`rich`) installed into it:
+
+```bash
+python3.11 -m venv ~/.venv
+~/.venv/bin/pip install -r ~/git/pingT/requirements.txt
+```
+
+**3. Activate the environment — every time** you log in, and in every new `tmux` window,
+before you start pingT or scanT:
+
+```bash
+source ~/.venv/bin/activate
+```
+
+Your prompt then starts with `(.venv)`, and `python3` is the environment's Python 3.11 with
+`rich`. Forgot it? pingT stops with *"the Python package 'rich' is missing"* — activate and
+start again. (If this is the only environment you use, you can put the line into your
+`~/.bashrc`, then it's always active.)
+
+## Quick start
+
+**1. Activate the environment and go to the pingT folder**
+
+```bash
+source ~/.venv/bin/activate
+cd ~/git/pingT
 ```
 
 **2. Write a host list** — a text file, e.g. `hosts.txt`, one IP per line:
@@ -31,23 +90,22 @@ cd pingT        # wherever you put it
 
 - `[Servers]` starts a group. Groups are just for the display.
 - A name after the IP is optional. Without one, the IP is shown.
-- Don't want to type it? Let the [scanner](#the-scanner-optional) write it for you.
+- Don't want to type it? Let [scanT](#the-scanner-scant-optional) write it for you.
 
 **3. Start pingT**
 
 ```bash
-./pingT -f hosts.txt --fresh
+python3 pingT.py -f hosts.txt --fresh
 ```
 
 `--fresh` starts a new session. Leave it out only when you restart pingT during a
 migration (see [below](#if-pingt-was-closed-or-crashed)).
 
-**4. Stop it with `q`.** pingT prints a summary and saves it as a file in this folder.
+**4. Stop it with `q`.** pingT prints a summary and saves it as a file in the `logs/` folder.
 
+`python3 pingT.py --help` shows all options, the keys and examples.
 Using **PuTTY** and seeing boxes instead of symbols? Start with `--charset safe`
 (see [troubleshooting](#putty-shows-boxes-or-garbage)).
-
----
 
 ## What you see
 
@@ -95,7 +153,7 @@ Clients 2F      73/76  ●X●●●●●●●● ●●●●●●●●●�
 | `q` | quit (summary is printed and saved) |
 | `v` | switch view: groups ↔ every host as its own box |
 | `n` | names: your **label** → **DNS** name → **IP** (and around again) |
-| `r` `r` | reset the loss counters (press twice) |
+| `r` `r` | reset the loss counters (press twice; the summary keeps what they held) |
 | `x` | ignore the down hosts of a group (see [clients that went home](#clients-that-went-home)) |
 | `g` | characters: unicode → safe → ascii, for PuTTY (see [troubleshooting](#putty-shows-boxes-or-garbage)) |
 | `Esc` | cancel a question (`r`, `x`) |
@@ -103,20 +161,25 @@ Clients 2F      73/76  ●X●●●●●●●● ●●●●●●●●●�
 While `r` or `x` waits for its answer, other keys (arrow keys too) do nothing — only the answer,
 `Esc`, or 5 seconds without a key close it.
 
----
-
 ## On migration day
 
 **Before the cut-over**
 
-1. Run pingT on a machine that is **not** connected through the switches you are
-   migrating — otherwise pingT loses its own network during the cut-over.
-2. Start it inside `tmux` (or `screen`), so a dropped SSH session doesn't stop it.
-3. Start it **15–30 minutes before** the cut-over, with `--fresh`:
-   `./pingT -f hosts.txt --fresh`
-   In that time pingT learns which hosts are online. Hosts that never answer are
-   greyed out and ignored — they were off before you touched anything.
-4. Clients switched off while you wait? Just before the cut-over, ignore them with `x`
+1. **Optional:** Start it inside `tmux`, so a dropped SSH session doesn't stop it:
+
+   ```bash
+   tmux new -s pingT              # a new tmux session called "pingT"
+   source ~/.venv/bin/activate    # inside tmux, too
+   cd ~/git/pingT
+   python3 pingT.py -f hosts.txt --fresh
+   ```
+
+   `Ctrl-b` then `d` leaves tmux with pingT still running; `tmux attach -t pingT` brings you
+   back — also after the SSH session dropped.
+2. Start it **15–30 minutes before** the cut-over, with `--fresh`. In that time pingT learns
+   which hosts are online. Hosts that never answer are greyed out and ignored — they were
+   off before you touched anything.
+3. Clients switched off while you wait? Just before the cut-over, ignore them with `x`
    (see [clients that went home](#clients-that-went-home)), so `back` is green when you start.
 
 **During the cut-over**
@@ -136,8 +199,10 @@ While `r` or `x` waits for its answer, other keys (arrow keys too) do nothing �
 - Hosts that are back but still losing pings stay yellow/red in the problems list —
   that is real packet loss on the new setup.
 
-**When you're done:** press `q`. The summary file lists every host that did **not**
-come back, every outage and all packet loss — your migration record.
+**When you're done:** press `q`. The summary file (in `logs/`) lists every host that did
+**not** come back, a timeline of the group outages, every outage and all packet loss — your
+migration record. Move the files in `logs/` off the box when you're done (see
+[files pingT writes](#files-pingt-writes)).
 
 ### Clients that went home
 
@@ -171,20 +236,18 @@ grey `-`, raise no alarm and don't count in `back`. The top line shows `ignored 
 Start it again **without** `--fresh`:
 
 ```bash
-./pingT -f hosts.txt
+python3 pingT.py -f hosts.txt
 ```
 
-pingT remembers (in its baseline file) which hosts were online before, so hosts that
-are still down show up as down instead of being ignored as "never answered". When that
+pingT remembers (in its baseline file in `logs/`) which hosts were online before, so hosts
+that are still down show up as down instead of being ignored as "never answered". When that
 file is older than 24 hours — then you probably wanted `--fresh` — a yellow warning stays
 in the top line until you press a key.
 
----
+## The scanner scanT (optional)
 
-## The scanner (optional)
-
-The scanner pings every address of your subnets and writes a host list with all
-devices that answered. You can use that list directly with pingT.
+scanT pings every address of your subnets and writes a host list with all devices that
+answered. You can use that list directly with pingT.
 
 **1. Write a subnet list**, e.g. `subnets.txt` — one subnet per line, with a group name:
 
@@ -194,10 +257,11 @@ devices that answered. You can use that list directly with pingT.
 10.0.30.0/24   Printers
 ```
 
-**2. Scan** — best during working hours, when the clients are switched on:
+**2. Scan** — best during working hours, when the clients are switched on (environment
+activated, in `~/git/pingT`):
 
 ```bash
-./scan.py -f subnets.txt -o hosts.txt
+python3 scanT.py -f subnets.txt -o hosts.txt
 ```
 
 Now add your names (labels) to `hosts.txt` if you like, and run pingT with it on migration day.
@@ -205,7 +269,7 @@ Now add your names (labels) to `hosts.txt` if you like, and run pingT with it on
 **Scanning again later** (e.g. a few days before the migration) without losing anything:
 
 ```bash
-./scan.py --rescan hosts.txt
+python3 scanT.py --rescan hosts.txt
 ```
 
 This scans the subnets of `hosts.txt` again (they are written in the file) and **only adds**
@@ -226,7 +290,7 @@ The old file is saved as `hosts.txt.bak`.
 - **Don't want a device any more?** Comment its line out (`# 10.0.20.11 pc-old`). A rescan
   won't add it again.
 - **A host list you wrote by hand** has no subnets in it yet. Give them once:
-  `./scan.py --rescan hosts.txt -f subnets.txt` — they are then written into the file.
+  `python3 scanT.py --rescan hosts.txt -f subnets.txt` — they are then written into the file.
 - A new scan **won't overwrite** an existing host list (you'd lose your names). Use
   `--rescan`, or `--overwrite` if you really want a fresh list.
 
@@ -237,65 +301,72 @@ Good to know:
 - It only finds devices that answer ping. Devices with ping blocked (e.g. Windows PCs
   with firewall) can't be found — and pingT couldn't watch them anyway.
 - Only scan networks you are responsible for.
+- `python3 scanT.py --help` shows all options and examples.
 
 ---
 
-# Reference
+# Part 2: Reference
 
-Everything in detail. You don't need this to use the tools.
-
-- [pingT options](#pingt-options)
-- [Scanner options](#scanner-options)
-- [States and alarms](#states-and-alarms)
-- [The screen in detail](#the-screen-in-detail)
-- [Host list format](#host-list-format)
-- [Files pingT writes](#files-pingt-writes)
-- [DNS names](#dns-names)
-- [How often hosts are pinged](#how-often-hosts-are-pinged)
-- [Troubleshooting](#troubleshooting)
-- [For the maintainer](#for-the-maintainer)
+Everything in detail. You don't need this to use the tools — look things up here when you
+need them. All commands assume the environment is activated (see [setup](#setup-once)).
 
 ## pingT options
 
 ```
-./pingT [IP ...] [-f FILE] [options]
+python3 pingT.py [IP ...] [-f FILE] [options]
 ```
+
+`python3 pingT.py --help` shows the same, grouped, with examples and the keys.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-f FILE` | | host list; can be given more than once. IPs can also be listed directly: `./pingT 10.0.0.1 10.0.0.2` |
+| `-f FILE` | | host list; can be given more than once. IPs can also be listed directly: `python3 pingT.py 10.0.0.1 10.0.0.2` |
 | `--fresh` | | start a new session: forget which hosts were online in an earlier run |
-| `-i SEC` | `1.0` | seconds between two pings to the same host (min 0.2) |
+| `-i SECONDS` | `1.0` | seconds between two pings to the same host (min 0.2) |
 | `-t MS` | `800` | how long to wait for a reply (50–10000) |
-| `-w N` | `20` | how many recent pings count for the loss check |
+| `-w PINGS` | `20` | how many recent pings count for the loss check |
 | `--warn N` | `2` | lost pings (out of the last `-w`) until yellow |
 | `--loss N` | `3` | lost pings (out of the last `-w`) until red |
 | `--down N` | `3` | lost pings **in a row** until down |
-| `--events N` | `8` | lines of the event list on screen (0 = hide) |
-| `--log FILE` | `pingT-events.log` | event log file; the summary and baseline files are named after it |
+| `--events LINES` | `8` | lines of the event list on screen (0 = hide) |
+| `--log FILE` | `logs/pingT-events.log` | event log file; the summary and baseline files go next to it, named after it |
 | `--no-dns` | | don't look up DNS names |
 | `--charset NAME` | `unicode` | characters to draw with: `unicode`, `safe`, `ascii` (see [PuTTY](#putty-shows-boxes-or-garbage)); the default comes from `PINGT_CHARSET` if set |
-| `--charset-test` | | print all three character sets and exit |
+| `--version` | | show the version |
+| `--help` | | all options, the keys, examples |
 
 The thresholds must fit together: `1 <= --warn <= --loss <= -w`.
 
-## Scanner options
+**From another folder:** pingT doesn't have to be started in its own folder. Host lists are
+read relative to the folder you are in; the files pingT writes still go to `logs/` next to
+`pingT.py`:
+
+```bash
+cd ~/migrations/site-a
+python3 ~/git/pingT/pingT.py -f hosts.txt --fresh
+```
+
+## scanT options
 
 ```
-./scan.py [SUBNET ...] [-f FILE] [-o OUT] [options]
-./scan.py --rescan FILE [SUBNET ...] [-f FILE] [options]
+python3 scanT.py [SUBNET ...] [-f FILE] [-o OUT] [options]
+python3 scanT.py --rescan HOSTLIST [SUBNET ...] [-f FILE] [options]
 ```
+
+`python3 scanT.py --help` shows the same, grouped, with examples.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-f FILE` | | subnet list; can be given more than once. Subnets can also be listed directly: `./scan.py 10.0.10.0/24=Servers` |
+| `-f FILE` | | subnet list; can be given more than once. Subnets can also be listed directly: `python3 scanT.py 10.0.10.0/24=Servers` |
 | `-o FILE` | `inventory.txt` | host list to write. An existing file is kept as `FILE.bak`. With `--rescan`: the rescanned file itself |
-| `--rescan FILE` | | scan the subnets of this host list again and only **add** new devices; prints a diff (see [the scanner](#the-scanner-optional)) |
+| `--rescan HOSTLIST` | | scan the subnets of this host list again and only **add** new devices; prints a diff (see [the scanner](#the-scanner-scant-optional)) |
 | `--overwrite` | | let a new scan replace an existing host list (its names are lost) |
 | `-t MS` | `500` | how long to wait for a reply |
-| `--rate N` | `400` | max pings per second in total |
+| `--rate PINGS` | `400` | max pings per second in total |
 | `--force` | | allow subnets bigger than `/16` or more than 262,144 addresses in one scan |
 | `--charset NAME` | `unicode` | as for pingT |
+| `--version` | | show the version |
+| `--help` | | all options, examples |
 
 - **Rounds:** rounds 2 and 3 only re-try the addresses that didn't answer. The network and
   broadcast address of a subnet are skipped.
@@ -308,7 +379,7 @@ The thresholds must fit together: `1 <= --warn <= --loss <= -w`.
 - **Ctrl-C** (or repeated fping errors) stops the scan and writes what was found to
   `FILE.partial` — your host list is **not** changed.
 - **The output folder** is checked before the scan starts, so a typo in `-o` can't cost you a scan.
-- **`--rescan`:** the subnets are the `# 10.0.10.0/24: …` lines above each group (the scanner
+- **`--rescan`:** the subnets are the `# 10.0.10.0/24: …` lines above each group (scanT
   writes them). Subnets given with `-f` or on the command line are used instead, and written
   into the file for the next rescan. Devices outside these subnets, and DNS names, are left
   alone. A device commented out (`# 10.0.10.5 …`) is not added again.
@@ -334,7 +405,8 @@ pingT looks at the last 20 pings of each host (`-w`). The exact limits behind th
 - **ALL DOWN:** every watched host (answered before, not ignored) is down at the same time,
   and there are at least 5 of them. Shown in the top line, the log and the summary.
 - `r` `r` resets the loss counters (to measure only the time after the cut-over).
-  Note: it also clears finished outages from the summary; the event log still has them.
+  Nothing is lost: the summary shows what the counters held before, as its own table
+  ("Before the reset at …"), and the group outage timeline is not reset at all.
   Hosts that are down at that moment stay down, and their outage still counts from when it
   started.
 
@@ -356,6 +428,7 @@ pingT looks at the last 20 pings of each host (`-w`). The exact limits behind th
 | purple `PING ERROR …` / `STALE …` | pinging itself has a problem — the screen may be out of date (see [troubleshooting](#troubleshooting)) |
 | purple `ALL DOWN …` | every host is down at once — check pingT's own network |
 | yellow `baseline is … old …` | the baseline is older than 24 h; any key hides it |
+| `pingT 3.0 - by Timmy` | version and credits, at the far right — only when the window is wide enough |
 
 When the window is narrow, the less important parts are hidden first.
 
@@ -411,11 +484,11 @@ switch01.corp.local   sw01        # a DNS name also works
 - DNS names are looked up **once** at start (IPv4 only); pingT then pings the IP. If a name
   gets a new IP during the run, restart pingT. A name without an answer within 5 s is invalid.
 - Example: [hosts.example.txt](hosts.example.txt). To just try pingT out, list a few
-  IPs directly: `./pingT 1.1.1.1 8.8.8.8`
+  IPs directly: `python3 pingT.py 1.1.1.1 8.8.8.8`
 
 ## Files pingT writes
 
-Next to the event log — with the default `--log`, in the folder you start pingT from:
+Into the **`logs/` folder next to `pingT.py`** — wherever you start it from:
 
 | File | Content |
 |---|---|
@@ -423,9 +496,20 @@ Next to the event log — with the default `--log`, in the folder you start ping
 | `pingT-events-summary-<date>-<time>.txt` | the summary, saved every time pingT stops (named with the time it stopped) |
 | `pingT-events-baseline.json` | which hosts were online (for [restarts](#if-pingt-was-closed-or-crashed)) |
 
-With `--log other.log` the files are named `other…` instead of `pingT-events…`.
+After a migration, move them off the box or delete them. Keep the baseline only as long as
+you may still need to restart pingT for that migration. Git ignores everything in `logs/`.
 
-The summary is also saved on Ctrl-C, `kill`, or when the SSH session drops.
+With `--log /some/where/other.log` the files go next to that file and are named `other…`
+instead of `pingT-events…`.
+
+**The summary** has, after the per-group table: a **timeline of the group outages** (when 2
+or more hosts of a group went down, when the group was complete again, how long it took),
+the hosts that are not back, invalid and ignored entries, the hosts with packet loss, and
+for every `r` `r` what the counters held before it. It is also saved on Ctrl-C, `kill`, or
+when the SSH session drops.
+
+scanT writes its host lists where `-o` says (default `inventory.txt` in the current folder),
+plus `.bak` and `.partial` files next to them.
 
 ## DNS names
 
@@ -463,10 +547,9 @@ name. One more `n` shows the IPs, the next one your labels again.
 PuTTY's fonts lack some of pingT's symbols (`▁▂▃`, `✖`, the heavy table lines), and
 PuTTY doesn't take them from another font. Three ways out:
 
-1. **Use the safe characters:** `./pingT -f hosts.txt --charset safe`. They are in every
-   Windows console font (Courier New, Lucida Console, Consolas). To make it the default for
-   you, put `export PINGT_CHARSET=safe` into your `~/.bashrc` on the server. Try it
-   while pingT runs: `g` switches unicode → safe → ascii.
+1. **Use the safe characters:** `python3 pingT.py -f hosts.txt --charset safe`. They are in
+   every Windows console font (Courier New, Lucida Console, Consolas). To make it the default
+   for you, put `export PINGT_CHARSET=safe` into your `~/.bashrc` on the server.
 2. **Garbage like `â—`** means PuTTY's character set isn't UTF-8: set *Window → Translation →
    Remote character set* to **UTF-8** — or use `--charset ascii`, which works with any
    setting.
@@ -474,39 +557,42 @@ PuTTY doesn't take them from another font. Three ways out:
    (`ssh user@server` in Windows Terminal). It finds missing symbols in other fonts, so
    the full unicode look works.
 
-`./pingT --charset-test` prints all three sets — use the first line where every character
-looks right.
+While pingT runs, press `g` to try the three sets on the real screen.
 
 ### Other problems
 
 | Problem | What to do |
 |---|---|
+| `… the Python package 'rich' is missing …` | The environment isn't active: `source ~/.venv/bin/activate`, then start again (see [setup](#setup-once)). |
+| `python3.11: command not found` while setting up | Python 3.11 isn't on that machine — ask whoever runs the server. pingT works with Python 3.9 or newer, so `python3 -m venv ~/.venv` is the fallback. |
+| `No such file or directory: ./pingT` (or `./scan.py`) | Since 3.0 the commands are `python3 pingT.py` and `python3 scanT.py` (see [CHANGELOG.md](CHANGELOG.md)). |
+| `can't open file '…/pingT.py'` | You are not in the pingT folder: `cd ~/git/pingT`, or give the full path `python3 ~/git/pingT/pingT.py …`. |
 | Purple **`PING ERROR`** at the top | fping can't run, e.g. missing permissions. Check with `fping 127.0.0.1`. Hosts are **not** marked down meanwhile. |
 | `PING ERROR … 64 of 255 hosts not pinged this round` | One of several fping processes failed. All other hosts are pinged normally; the affected hosts keep their last state until it works again. |
 | Purple **`STALE`** at the top | No ping round finished for a while — the screen is out of date. |
 | Purple **`ALL DOWN`** at the top | Every host is down at once — usually pingT's own network (cable, uplink, VPN). Check the machine pingT runs on. |
 | Switches/routers show some lost pings | They limit how many pings they answer. Try `-i 2`, or higher `--warn`/`--loss`. |
 | Many hosts grey (silent) | They haven't answered since pingT started: switched off, or blocking ping. Start pingT earlier. |
-| After a restart everything is grey | You started with `--fresh`, or from another folder, or with another `--log` (the baseline file is next to the event log). |
+| After a restart everything is grey | You started with `--fresh`, or with another `--log`, or the baseline in `logs/` was deleted. |
 | `invalid` hosts at the top | Typos or unknown names in the host list; shown with file and line number. |
 | `note: with N hosts a round can take ~Xs …` at start | Harmless: with more than ~1,000 hosts (or a long `-t`), a round takes longer than 1 s when many hosts are down. |
-| `… the Python package 'rich' is missing …` | You started it without your Python environment. Activate it (the one with `rich` installed) and start again. |
-| `Permission denied` when starting `./pingT` | The file lost its "executable" flag while copying: `chmod +x pingT scan.py`. |
-| Scanner: `… more than a /16` | Protection against typos (`/8` would be 16 million addresses). Split the range or add `--force`. |
-| Scanner: `hosts.txt exists - use --rescan …` | A new scan would replace your list and its names. Use `--rescan hosts.txt`, or `--overwrite`. |
+| scanT: `… more than a /16` | Protection against typos (`/8` would be 16 million addresses). Split the range or add `--force`. |
+| scanT: `hosts.txt exists - use --rescan …` | A new scan would replace your list and its names. Use `--rescan hosts.txt`, or `--overwrite`. |
 
 ## For the maintainer
 
-**The server needs:** Linux (macOS works too), Python 3.9 or newer, `fping`, and the Python
-package `rich` ([requirements.txt](requirements.txt)). Nothing needs root.
+**The server needs:** Linux (macOS works too), Python 3.9 or newer — the team's environment
+uses 3.11 ([setup](#setup-once)) —, `fping` (installed on the server), and the Python package
+`rich` ([requirements.txt](requirements.txt)). Nothing needs root.
 
-**Version:** `./pingT --version` (scan.py has the same number). It lives in `__version__` in
-`pingt.py`; what changed in each version is in [CHANGELOG.md](CHANGELOG.md).
+**Version:** `python3 pingT.py --version` (scanT has the same number). It lives in
+`__version__` in `timmy_pinger/__init__.py`; what changed in each version is in
+[CHANGELOG.md](CHANGELOG.md).
 
 **Design decisions** — why things are the way they are (IPv4 only, a rescan only adds, …):
 [DECISIONS.md](DECISIONS.md). Add an entry there when you decide something new.
 
-**Tests:** from the pingT folder, with the Python that has `rich`:
+**Tests:** in the pingT folder, with the environment activated:
 
 ```bash
 python3 -m unittest discover -s tests
@@ -515,13 +601,34 @@ python3 -m unittest discover -s tests
 They take about a minute and need no network: a fake `fping` (`tests/fakebin/fping`) answers
 instead. Some tests run pingT in a pseudo terminal, so they need Linux or macOS.
 
+**The code** (`timmy_pinger/`), roughly in the order a ping takes through it:
+
+| Module | What it does |
+|---|---|
+| `hostlist.py` | reads host lists, checks every entry (IPv4 only) |
+| `dns.py` | DNS names → IPs at start; the reverse lookups behind `n` |
+| `fping.py` | runs fping: one probe per host and round, many processes in parallel |
+| `host.py` | one host and its state machine: what a reply or a lost ping does |
+| `session.py` | a pingT run: the ping loop, group outages, ALL DOWN, reset, ignore |
+| `baseline.py` | the baseline file |
+| `events.py` | the event log; grouping per group and round |
+| `screen.py` | everything on screen (only reads the session) |
+| `controls.py` / `keyboard.py` | what the keys do / reading single keys |
+| `summary.py` | the summary on screen and as a file |
+| `charsets.py` / `durations.py` | the three character sets / how durations are written |
+| `cli.py` | pingT's options and main loop |
+| `scanner.py` / `inventory.py` | scanT / reading and changing the host list files it writes |
+
+Three threads share a session (ping loop, reverse lookups, screen and keys): everything that
+touches it holds `session.lock`.
+
 **Files**
 
 | File | Purpose |
 |---|---|
-| `pingT` | start script for the pinger |
-| `pingt.py` | the pinger's code |
-| `scan.py` | the scanner |
+| `pingT.py` / `scanT.py` | the commands — they only start the code in `timmy_pinger/` |
+| `timmy_pinger/` | the code (see the table above) |
+| `logs/` | what pingT writes (only its README is in git) |
 | `requirements.txt` | the Python package pingT needs (`rich`) |
 | `hosts.example.txt` / `subnets.example.txt` | example host and subnet lists |
 | `DECISIONS.md` / `CHANGELOG.md` | design decisions / what changed in each version |

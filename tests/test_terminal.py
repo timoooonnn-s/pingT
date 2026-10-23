@@ -1,17 +1,19 @@
-"""pingT end to end: started through ./pingT in a pseudo terminal, with the fake fping."""
+"""pingT end to end: started through pingT.py in a pseudo terminal, with the fake fping."""
 from __future__ import annotations
 
 import glob
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import time
 import unittest
 
 from helpers import REPO, Term, WorkdirTest, fake_env, read, set_state, wait_for
 
-PINGT = os.path.join(REPO, "pingT")
+PINGT = os.path.join(REPO, "pingT.py")
 HOSTS = ("[Servers]\n10.9.0.1 srv1\n10.9.0.2 srv2\nlocalhost lo-by-name\n"
          "[Clients 2F]\n" + "".join(f"10.9.1.{i} pc{i}\n" for i in range(1, 7)) +
          "[Printers]\n10.9.2.1 prn1\n10.9.2.300 typo\n10.9.0.1 duplicate\n")  # 10 valid, 1 invalid, 1 duplicate
@@ -19,6 +21,8 @@ HOSTS = ("[Servers]\n10.9.0.1 srv1\n10.9.0.2 srv2\nlocalhost lo-by-name\n"
 
 class TerminalTest(WorkdirTest):
     def start(self, *args, rows=30, cols=120, **env) -> Term:
+        if "--log" not in args:  # never into the repo's logs/ folder
+            args = (*args, "--log", self.path("pingT-events.log"))
         t = Term([sys.executable, PINGT, *args], self.dir, fake_env(self.dir, **env), rows, cols)
         self.addCleanup(t.close)
         return t
@@ -127,7 +131,7 @@ class TestEdges(TerminalTest):
     def test_old_baseline_sigterm_custom_log(self):
         with open(self.path("mig-baseline.json"), "w") as fh:
             json.dump({"saved": "2026-01-01T00:00:00", "seen": ["10.9.0.1"]}, fh)
-        t = self.start("10.9.0.1", "--log", "mig.log")
+        t = self.start("10.9.0.1", "--log", self.path("mig.log"))
         self.assertTrue(wait_for(lambda: "restart with --fresh (any key hides this)" in t.frame(), 8), t.frame())
         time.sleep(1.5)
         self.assertIn("restart with --fresh", t.frame())  # stays
@@ -172,6 +176,25 @@ class TestEdges(TerminalTest):
         t = self.start("10.9.0.1", PINGT_CHARSET="fancy")
         t.wait_exit()
         self.assertIn("PINGT_CHARSET='fancy' is unknown", t.text())
+
+    def test_default_log_folder(self):
+        """Without --log, everything goes into logs/ next to pingT.py - checked on a copy of the tool."""
+        tool = self.path("tool")
+        os.makedirs(tool)
+        shutil.copy(PINGT, tool)
+        shutil.copytree(os.path.join(REPO, "timmy_pinger"), os.path.join(tool, "timmy_pinger"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        t = Term([sys.executable, os.path.join(tool, "pingT.py"), "10.9.0.1"], self.dir, fake_env(self.dir))
+        self.addCleanup(t.close)
+        self.assertTrue(wait_for(lambda: "back 1/1" in t.frame(), 8))
+        self.quit(t)
+        logs = sorted(os.listdir(os.path.join(tool, "logs")))
+        self.assertEqual([name.split("-2")[0] for name in logs],
+                         ["pingT-events-baseline.json", "pingT-events-summary", "pingT-events.log"])
+
+    def test_removed_option(self):
+        r = subprocess.run([sys.executable, PINGT, "--charset-test"], capture_output=True, text=True)
+        self.assertIn("unrecognized arguments: --charset-test", r.stderr)
 
 
 if __name__ == "__main__":

@@ -134,3 +134,70 @@ runs on which server.
 **How to bump:** `MAJOR.MINOR`. MINOR for fixes and new features; MAJOR when something
 people rely on changes in a way that breaks it (an option removed, a file format changed).
 Every bump gets an entry in [CHANGELOG.md](CHANGELOG.md).
+
+## 14. The code is a package of modules, rebuilt, not rewritten — 2026-10-23
+
+**Decision:** the code lives in `timmy_pinger/`, one module per job (README "For the
+maintainer"). It was rebuilt from the 2.0 code: same algorithms, new structure and names.
+
+**Why:** in 2.0 one class did five jobs (state machine, events, baseline, key dialogs, the whole
+screen), and the scanner imported all of the pinger for six helpers. The algorithms themselves
+were tested in real migrations, so they were kept, not rewritten.
+
+**Rules that keep it that way:**
+- `host.py` knows nothing about screens or files: `record_ping()` returns events, the session
+  writes them.
+- `screen.py` only reads the session; the keys change `ViewSettings`.
+- Three threads share a session; everything that touches it holds `session.lock`.
+- No abstract base classes, interfaces with one implementation or config objects - plain
+  functions and small classes until something really needs more.
+
+## 15. The commands are `pingT.py` and `scanT.py` — clean break — 2026-10-23
+
+**Decision:** `./pingT` became `./pingT.py`, `./scan.py` became `./scanT.py`. No forwarders under
+the old names. Version 3.0, because people type these commands from memory (decision 13).
+
+**Consequences:** the package can't be called `pingt/`: on macOS (and Windows) file names
+ignore case, so it would be the same name as `pingT.py`. Hence `timmy_pinger/`.
+
+## 16. Logs, summaries and the baseline go into `logs/` — 2026-10-23
+
+**Decision:** by default pingT writes into `logs/` next to `pingT.py`, not into the folder it is
+started from. Only `logs/README.md` is in git.
+
+**Why:** one place to move off the box or delete after a migration. It also ends a trap: started
+from another folder, pingT used to miss its baseline and showed down hosts as "never answered".
+
+## 17. `r r` keeps the record — 2026-10-23
+
+**Decision:** a reset still starts the counters fresh (on screen nothing changes), but the
+summary keeps what they held before, as its own table per reset. The group outage timeline is
+never reset.
+
+**Why:** the summary is the migration record; one key press must not quietly remove part of it.
+
+## 18. `--charset-test` removed — 2026-10-23
+
+**Decision:** the `g` key is the way to try the character sets (decision 7 otherwise stands).
+
+**Why:** two ways to do one thing; `g` shows the real screen, which is the better test.
+
+## 19. Credits — 2026-10-23
+
+**Decision:** `pingT <version> - by Timmy` in the top line (its least important part, so only
+shown when there is room), in `--help`, `--version` and the first line of the summary file.
+
+## 20. How pingT is set up and started — 2026-10-23
+
+**Decision:** every engineer has one Python 3.11 environment in the home folder (`~/.venv`,
+with `requirements.txt` installed) and activates it before starting the tools. The README and
+`--help` write every command as `python3 pingT.py …` / `python3 scanT.py …`, not `./pingT.py`.
+The code comes from the company's internal repository (`git clone`, then `git pull` for updates);
+fping is already installed on the server.
+
+**Why:** files copied from Windows (WinSCP & co.) often lose the "executable" flag, so
+`./pingT.py` fails with "Permission denied" - `python3 pingT.py` always works. Writing `python3`
+also makes visible which Python runs, which is where a missing `rich` comes from.
+
+**Open:** the address of the internal repository - the README's setup has a placeholder
+`<INTERNAL-REPO-URL>` until it is known.

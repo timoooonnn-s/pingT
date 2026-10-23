@@ -1,4 +1,7 @@
-# --- what pingT and scan.py write (names follow --log, default pingT-events.log)
+# --- what pingT writes: by default into logs/ (only its README is in git);
+#     with --log elsewhere the names follow --log
+logs/*
+!logs/README.md
 *.log
 *-summary-*.txt
 *-baseline.json
@@ -10,6 +13,9 @@
 hosts.txt
 subnets.txt
 inventory.txt
+!hosts.example.txt
+!subnets.example.txt
+!requirements.txt
 
 # --- Python
 __pycache__/
@@ -22,3 +28,7 @@ env/
 .idea/
 .vscode/
 .DS_Store
+
+
+# --- cache stuff
+*cache
