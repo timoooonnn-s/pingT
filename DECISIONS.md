@@ -65,8 +65,7 @@ Dropping it would remove it from the next migration's watch list without anyone 
 to `--rescan`. `--overwrite` replaces it anyway (the old file is kept as `.bak`).
 
 **Why:** a new scan writes bare IPs; replacing a list would silently lose its labels and the
-hosts that are switched off right now. Proposed during the review, not yet confirmed by the
-maintainer.
+hosts that are switched off right now.
 
 ## 7. Three character sets; unicode stays the default — 2026-10-23
 
@@ -121,3 +120,17 @@ but the Python that runs pingT (with `rich`).
 
 **Why:** the servers pingT runs on shouldn't need extra packages, and every engineer should
 be able to run the tests with one command (README "For the maintainer").
+
+## 13. Version numbers — 2026-10-23
+
+**Decision:** pingT and scan.py share one version number, `__version__` in `pingt.py`
+(`./pingT --version`, `./scan.py --version`). It is also written into the event log, the
+summary and the host lists the scanner writes. The first numbered version is **2.0**:
+copies from before had no number and count as 1.x.
+
+**Why:** the tool is copied around the team; without a number nobody can tell which version
+runs on which server.
+
+**How to bump:** `MAJOR.MINOR`. MINOR for fixes and new features; MAJOR when something
+people rely on changes in a way that breaks it (an option removed, a file format changed).
+Every bump gets an entry in [CHANGELOG.md](CHANGELOG.md).

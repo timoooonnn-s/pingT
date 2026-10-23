@@ -500,6 +500,9 @@ looks right.
 **The server needs:** Linux (macOS works too), Python 3.9 or newer, `fping`, and the Python
 package `rich` ([requirements.txt](requirements.txt)). Nothing needs root.
 
+**Version:** `./pingT --version` (scan.py has the same number). It lives in `__version__` in
+`pingt.py`; what changed in each version is in [CHANGELOG.md](CHANGELOG.md).
+
 **Design decisions** — why things are the way they are (IPv4 only, a rescan only adds, …):
 [DECISIONS.md](DECISIONS.md). Add an entry there when you decide something new.
 
@@ -521,6 +524,6 @@ instead. Some tests run pingT in a pseudo terminal, so they need Linux or macOS.
 | `scan.py` | the scanner |
 | `requirements.txt` | the Python package pingT needs (`rich`) |
 | `hosts.example.txt` / `subnets.example.txt` | example host and subnet lists |
-| `DECISIONS.md` | design decisions |
+| `DECISIONS.md` / `CHANGELOG.md` | design decisions / what changed in each version |
 | `tests/` | the tests and the fake `fping` |
 | `.gitignore` | keeps logs, summaries, baselines, `.bak`/`.partial` files and users' own `hosts.txt` / `subnets.txt` / `inventory.txt` out of git |

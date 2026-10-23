@@ -12,6 +12,8 @@ Keys:  q quit   r r reset stats   v view   n names (label / DNS / IP)   x ignore
 
 from __future__ import annotations
 
+__version__ = "2.0"  # also used by scan.py; see DECISIONS.md "Version numbers" and CHANGELOG.md
+
 import argparse
 import ipaddress
 import io
@@ -458,7 +460,7 @@ class Monitor:
         self.outages_by_group: dict[str, list] = {}  # group with DOWN hosts -> [since, orders of its DOWN hosts]
         self.all_down_log: list[list] = []  # [since, until or None] while every watched host was DOWN
         self.logfile = open(args.log, "a", encoding="utf-8")
-        self.event(None, f"started: {len(hosts)} hosts in {len(self.groups)} group{'s' * (len(self.groups) != 1)} via fping, "
+        self.event(None, f"started pingT {__version__}: {len(hosts)} hosts in {len(self.groups)} group{'s' * (len(self.groups) != 1)} via fping, "
                          f"window={args.window} warn>={args.warn} loss>={args.loss} down>={args.down}", "cyan")
         for h in hosts:
             if h.invalid:
@@ -1268,7 +1270,7 @@ def print_summary(console: Console, mon: Monitor):
         return Table(header_style="bold", box=mon.cs.box, **kw)
 
     up, seen = back_counts(mon.hosts)
-    console.print(f"\n[bold]Summary[/bold] - {fmt_dur(time.time() - mon.started)}, {mon.rounds} rounds, "
+    console.print(f"\n[bold]Summary[/bold] (pingT {__version__}) - {fmt_dur(time.time() - mon.started)}, {mon.rounds} rounds, "
                   f"[{'green' if all_back(up, seen) else 'bold red'}]back {up}/{seen}[/] "
                   f"hosts that answered at some point")
     gt = table()
@@ -1359,7 +1361,7 @@ def save_summary(mon: Monitor, path: str) -> str | None:
         buf.write(f"\n(summary incomplete: {type(e).__name__}: {e})\n")
     try:
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write(f"Timmy Pinger summary, written {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+            fh.write(f"Timmy Pinger {__version__} summary, written {datetime.now():%Y-%m-%d %H:%M:%S}\n")
             fh.write(buf.getvalue())
     except OSError as e:
         return str(e)
@@ -1368,6 +1370,7 @@ def save_summary(mon: Monitor, path: str) -> str | None:
 
 def main():
     ap = argparse.ArgumentParser(prog="pingT", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"pingT {__version__}")
     ap.add_argument("targets", nargs="*", help="hosts/IPs to ping (in addition to -f)")
     ap.add_argument("-f", "--file", action="append", default=[], help="hosts file (repeatable)")
     ap.add_argument("-i", "--interval", type=float, default=1.0, help="seconds between rounds (default 1.0)")
